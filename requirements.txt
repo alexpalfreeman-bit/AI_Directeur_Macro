@@ -1,0 +1,10 @@
+anthropic
+pydantic
+pydantic-settings
+python-dotenv
+yfinance
+requests
+feedparser
+chromadb
+python-telegram-bot
+pandas
