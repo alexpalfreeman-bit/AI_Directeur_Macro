@@ -47,7 +47,10 @@ def lancer_comite(contexte_actu: str) -> None:
     thesis = generate_thesis(contexte_actu)
     print(f"     Thème : {thesis.theme[:70]}...")
     print(f"     Tickers : {thesis.candidate_tickers} | Confiance : {thesis.confidence}")
+    lancer_comite_sur_these(thesis)
 
+def lancer_comite_sur_these(thesis) -> None:
+    """Fait passer une thèse (news OU screener) par le comité complet."""
     print("📊 [2/4] Agent Quant...")
     _, quant = validate_thesis(thesis)
     print(f"     Survivants : {quant.surviving_tickers}")
@@ -60,14 +63,12 @@ def lancer_comite(contexte_actu: str) -> None:
     decision = make_decision(thesis, quant, risk)
     print(f"     >>> ACTION : {decision.action.upper()} (confiance {decision.confidence})")
 
-    # Mise à jour du portefeuille
     print("\n📂 Mise à jour du portefeuille...")
     for ligne in record_decision(thesis, decision):
         print(ligne)
     portefeuille = snapshot_text(load_portfolio())
     print("\n" + portefeuille)
 
-    # Envoi sur Telegram (un seul envoi groupé)
     print("\n📲 Envoi sur Telegram...")
     asyncio.run(send_decision_et_portefeuille(thesis, decision, portefeuille))
     print("   Envoyé !")
@@ -81,6 +82,16 @@ def run_once() -> None:
         return
     lancer_comite(contexte)
 
+def run_screener() -> None:
+    """Cycle BOTTOM-UP : screener → thèse → comité → portefeuille → Telegram."""
+    from src.screener.screener_thesis import generer_these_screener
+
+    print("\n🔍 === CYCLE SCREENER (bottom-up) ===")
+    thesis = generer_these_screener(top_n=5)
+    print(f"     Thème : {thesis.theme[:70]}...")
+    print(f"     Tickers : {thesis.candidate_tickers} | Confiance : {thesis.confidence}")
+    lancer_comite_sur_these(thesis)   # on réutilise le comité (voir étape 4)
 
 if __name__ == "__main__":
     run_once()
+    #run_screener()
