@@ -176,11 +176,18 @@ def snapshot_text(p: Portfolio) -> str:
         s = "+" if pnl_r >= 0 else ""
         lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L réalisé {s}{pnl_r:.0f}$")
         # Comparaison avec le S&P 500
+# Comparaison avec le S&P 500 (avec rattrapage si le prix de départ manque)
+    if not p.spy_start_price:
+        spy_init = get_fundamentals("SPY").get("price")
+        if spy_init:
+            p.spy_start_price = spy_init
+            save_portfolio(p)   # on fige enfin le point de départ
+
     if p.spy_start_price:
         spy_now = get_fundamentals("SPY").get("price")
         if spy_now:
             perf_spy = (spy_now / p.spy_start_price - 1) * 100
-            alpha = perf - perf_spy   # ta surperformance vs le marché
+            alpha = perf - perf_spy
             s_spy = "+" if perf_spy >= 0 else ""
             s_alpha = "+" if alpha >= 0 else ""
             verdict = "🟢 tu BATS le marché" if alpha >= 0 else "🔴 le marché fait mieux"
