@@ -36,10 +36,18 @@ def get_fundamentals(ticker: str) -> dict:
     else:
         volatility_30d = None
 
+    # Prix robuste : actions → currentPrice ; ETF/indices → regularMarketPrice ou
+    # previousClose ; en dernier recours, le dernier cours de clôture de l'historique.
+    price = (info.get("currentPrice")
+             or info.get("regularMarketPrice")
+             or info.get("previousClose"))
+    if price is None and not hist.empty:
+        price = round(float(hist["Close"].iloc[-1]), 2)
+
     return {
         "ticker": ticker.upper(),
         "name": info.get("shortName"),
-        "price": info.get("currentPrice"),
+        "price": price,
         "pe_ratio": info.get("trailingPE"),
         "debt_to_equity": info.get("debtToEquity"),
         "revenue_growth_yoy": info.get("revenueGrowth"),
