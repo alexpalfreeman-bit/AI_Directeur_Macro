@@ -62,7 +62,15 @@ class Portfolio(BaseModel):
     cash: float = Field(default_factory=lambda: settings.starting_capital)
     positions: list[Position] = Field(default_factory=list)
     closed: list[ClosedPosition] = Field(default_factory=list)
+    spy_start_price: float | None = None      # ← AJOUTE : prix du S&P au démarrage
+    started_at: str = Field(default_factory=_now)   # ← AJOUTE : date de démarrage
 
+def _nouveau_portefeuille() -> Portfolio:
+    """Crée un portefeuille neuf en figeant le prix de départ du S&P 500."""
+    p = Portfolio()
+    spy = get_fundamentals("SPY").get("price")
+    p.spy_start_price = spy
+    return p
 
 def load_portfolio() -> Portfolio:
     # Cloud : lecture depuis Redis (persiste entre les exécutions)
@@ -70,13 +78,13 @@ def load_portfolio() -> Portfolio:
         data = _redis.get(PORTFOLIO_KEY)
         if data:
             return Portfolio.model_validate_json(data)
-        p = Portfolio()
+        p = _nouveau_portefeuille()
         save_portfolio(p)
         return p
     # Local : lecture depuis le fichier JSON
     if PORTFOLIO_FILE.exists():
         return Portfolio.model_validate_json(PORTFOLIO_FILE.read_text(encoding="utf-8"))
-    p = Portfolio()
+    p = _nouveau_portefeuille()
     save_portfolio(p)
     return p
 
@@ -167,6 +175,20 @@ def snapshot_text(p: Portfolio) -> str:
         pnl_r = sum(c.realized_pnl for c in p.closed)
         s = "+" if pnl_r >= 0 else ""
         lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L réalisé {s}{pnl_r:.0f}$")
+        # Comparaison avec le S&P 500
+    if p.spy_start_price:
+        spy_now = get_fundamentals("SPY").get("price")
+        if spy_now:
+            perf_spy = (spy_now / p.spy_start_price - 1) * 100
+            alpha = perf - perf_spy   # ta surperformance vs le marché
+            s_spy = "+" if perf_spy >= 0 else ""
+            s_alpha = "+" if alpha >= 0 else ""
+            verdict = "🟢 tu BATS le marché" if alpha >= 0 else "🔴 le marché fait mieux"
+            lignes += [
+                "",
+                f"  📊 S&P 500 (même période) : {s_spy}{perf_spy:.1f}%",
+                f"  ⭐ Ton alpha : {s_alpha}{alpha:.1f}%  ({verdict})",
+            ]
     return "\n".join(lignes)
 
 
