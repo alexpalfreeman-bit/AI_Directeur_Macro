@@ -6,9 +6,11 @@ chaque stop/objectif touché. Le fichier data/portfolio.json survit entre
 les exécutions : c'est la mémoire de tes positions.
 """
 from __future__ import annotations
+import os                                    
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel, Field
+from upstash_redis import Redis              
 
 from config.settings import settings
 from src.ingestion.market_client import get_fundamentals
@@ -17,6 +19,15 @@ from src.schemas.decision import PortfolioDecision
 
 PORTFOLIO_FILE = Path("data/portfolio.json")
 
+# Connexion Redis (cloud) si les variables d'environnement existent.
+# En local sans ces variables, on retombe automatiquement sur le fichier JSON.
+_redis = None
+_url = os.getenv("UPSTASH_REDIS_REST_URL")
+_token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+if _url and _token:
+    _redis = Redis(url=_url, token=_token)
+
+PORTFOLIO_KEY = "portfolio"
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -50,19 +61,29 @@ class Portfolio(BaseModel):
     closed: list[ClosedPosition] = Field(default_factory=list)
 
 
-# ─── Persistance (charger / sauvegarder le fichier JSON) ───
 def load_portfolio() -> Portfolio:
+    # Cloud : lecture depuis Redis (persiste entre les exécutions)
+    if _redis is not None:
+        data = _redis.get(PORTFOLIO_KEY)
+        if data:
+            return Portfolio.model_validate_json(data)
+        p = Portfolio()
+        save_portfolio(p)
+        return p
+    # Local : lecture depuis le fichier JSON
     if PORTFOLIO_FILE.exists():
         return Portfolio.model_validate_json(PORTFOLIO_FILE.read_text(encoding="utf-8"))
-    p = Portfolio()              # premier lancement : portefeuille neuf à 10 000 $
+    p = Portfolio()
     save_portfolio(p)
     return p
 
 
 def save_portfolio(p: Portfolio) -> None:
+    if _redis is not None:
+        _redis.set(PORTFOLIO_KEY, p.model_dump_json())
+        return
     PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
     PORTFOLIO_FILE.write_text(p.model_dump_json(indent=2), encoding="utf-8")
-
 
 # ─── Acheter (paper) ───
 def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
