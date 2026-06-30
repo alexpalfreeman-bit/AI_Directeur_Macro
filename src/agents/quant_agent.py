@@ -8,6 +8,8 @@ import anthropic
 from config.settings import settings
 from src.schemas.thesis import MacroThesis, TickerHealth, QuantValidation
 from src.ingestion.market_client import get_fundamentals
+from src.agents.tool_helper import appel_avec_retry
+
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -60,36 +62,22 @@ def validate_thesis(thesis: MacroThesis) -> tuple[list[TickerHealth], QuantValid
         "description": "Rend un verdict quantitatif structuré sur la thèse.",
         "input_schema": QuantValidation.model_json_schema(),
     }
-    response = client.messages.create(
-        model=settings.llm_model,
-        max_tokens=1200,
-        system=SYSTEM_PROMPT,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "rendre_verdict"},
-        messages=[{
-            "role": "user",
-            "content": (
-                f"THÈSE À VALIDER :\n{thesis.model_dump_json(indent=2)}\n\n"
-                f"CHIFFRES RÉELS (source yfinance — n'utilise QUE ceux-ci) :\n{data_text}\n\n"
-                "Rends ton verdict via l'outil 'rendre_verdict'."
-            ),
-        }],
+    user_content = (
+        f"THÈSE À VALIDER :\n{thesis.model_dump_json(indent=2)}\n\n"
+        f"CHIFFRES RÉELS (source yfinance — n'utilise QUE ceux-ci) :\n{data_text}\n\n"
+        "Rends ton verdict via l'outil 'rendre_verdict'. Remplis TOUS les champs."
     )
 
-    block = next(b for b in response.content if b.type == "tool_use")
-    data = dict(block.input)
-    data.pop("thesis_id", None)
-
-    try:
-        verdict = QuantValidation(thesis_id=thesis.thesis_id, **data)
-    except Exception as e:
-        # Filet de sécurité : on ne plante jamais, on signale et on continue
-        print(f"  ⚠️  Sortie du Quant incomplète, valeurs par défaut appliquées : {e}")
-        data.setdefault("verdict", "modified")
-        data.setdefault("surviving_tickers", [])
-        data.setdefault("market_already_pricing_in", False)
-        data.setdefault("quant_notes", "Champ manquant dans la réponse du LLM.")
-        verdict = QuantValidation(thesis_id=thesis.thesis_id, **data)
+    verdict = appel_avec_retry(
+        client=client,
+        model=settings.llm_model,
+        system=SYSTEM_PROMPT,
+        user_content=user_content,
+        tool_name="rendre_verdict",
+        schema=QuantValidation,
+        max_tokens=1200,
+        forcer_id={"thesis_id": thesis.thesis_id},   # on impose le bon id
+    )
 
     return real_data, verdict
 
