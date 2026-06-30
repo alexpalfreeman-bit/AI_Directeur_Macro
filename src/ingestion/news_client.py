@@ -60,6 +60,38 @@ def is_macro_relevant(title: str) -> bool:
         print(f"  ⚠️  Filtre en échec sur ce titre : {e}")
         return False
 
+def corroborer_actualites(headlines: list[dict]) -> str:
+    """
+    Regroupe les titres macro par thème et compte les sources distinctes.
+    Donne au Macro une vue de ce qui est CONFIRMÉ vs vu une seule fois.
+    """
+    if not headlines:
+        return "Aucune actualité macro disponible."
+
+    # On demande à un mini-LLM (Haiku) de regrouper les titres par thème commun
+    titres_numerotes = "\n".join(
+        f"{i+1}. [{h['source']}] {h['title']}" for i, h in enumerate(headlines)
+    )
+    prompt = (
+        "Voici des titres d'actualité macro, chacun avec sa source entre crochets.\n"
+        "Regroupe ceux qui parlent du MÊME événement/thème de fond. Pour chaque thème, "
+        "indique combien de SOURCES DISTINCTES le couvrent.\n\n"
+        "Réponds en texte simple, une ligne par thème, au format :\n"
+        "[N sources] Résumé du thème en une phrase\n"
+        "Classe du plus corroboré (plus de sources) au moins corroboré.\n\n"
+        f"TITRES :\n{titres_numerotes}"
+    )
+    try:
+        msg = client.messages.create(
+            model=settings.cheap_model,
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        print(f"  ⚠️  Corroboration en échec (on continue) : {e}")
+        # Repli : on renvoie juste les titres bruts
+        return "\n".join(f"- [{h['source']}] {h['title']}" for h in headlines)
 
 if __name__ == "__main__":
     print("\n📰 Récupération des actualités...")

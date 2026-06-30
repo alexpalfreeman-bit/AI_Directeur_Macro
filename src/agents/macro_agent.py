@@ -51,6 +51,14 @@ PRÉCISION DES TICKERS : utilise le symbole boursier EXACT et officiel (ex: "NU"
 Nu Holdings, pas "NUBANK" ; "GOOGL" pour Alphabet). Si tu n'es pas certain à 100% du
 symbole exact d'une société, ne la propose pas — préfère une entreprise dont tu
 connais le ticker avec certitude. Un mauvais symbole = un candidat perdu.
+
+CORROBORATION DES SOURCES : on te fournit une synthèse indiquant combien de SOURCES
+distinctes couvrent chaque thème. Règle de prudence : un catalyseur confirmé par
+PLUSIEURS sources mérite une confiance plus élevée. Un catalyseur vu dans UNE SEULE
+source est fragile (rumeur, info isolée, voire erreur) — traite-le avec méfiance et
+abaisse fortement ta confiance, ou ne bâtis pas de thèse dessus. Ne construis jamais
+un pari important sur un événement non corroboré.
+
 """
 
 

@@ -13,7 +13,7 @@ from src.agents.devils_advocate_agent import challenge_thesis
 from src.agents.portfolio_manager_agent import make_decision
 from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text
 from src.communication.telegram_bot import send_decision_et_portefeuille
-
+from src.ingestion.news_client import fetch_headlines, is_macro_relevant, corroborer_actualites
 
 def construire_contexte_actu(max_titres: int = 8) -> str:
     """Récupère les vraies actualités et garde celles qui sont macro-pertinentes."""
@@ -29,9 +29,17 @@ def construire_contexte_actu(max_titres: int = 8) -> str:
     if not retenus:
         return ""  # rien de macro aujourd'hui
 
-    print(f"   {len(retenus)} actualité(s) macro retenue(s).")
-    return "\n".join(f"- {item['title']} (source: {item['source']})" for item in retenus)
+    print(f"   {len(retenus)} actualité(s) macro retenue(s). Corroboration en cours...")
+    contexte_corrobore = corroborer_actualites(retenus)
 
+    # On donne au Macro à la fois la synthèse corroborée ET les titres détaillés
+    titres_detail = "\n".join(f"- [{item['source']}] {item['title']}" for item in retenus)
+    return (
+        "SYNTHÈSE CORROBORÉE (nombre de sources par thème) :\n"
+        f"{contexte_corrobore}\n\n"
+        "TITRES DÉTAILLÉS :\n"
+        f"{titres_detail}"
+    )
 
 def lancer_comite(contexte_actu: str) -> None:
     """Fait tourner le Comité complet sur un contexte d'actualités réelles."""
