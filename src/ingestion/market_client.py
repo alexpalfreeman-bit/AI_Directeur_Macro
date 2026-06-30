@@ -27,7 +27,7 @@ def get_fundamentals(ticker: str) -> dict:
             "ticker": ticker.upper(), "name": None, "price": None,
             "pe_ratio": None, "debt_to_equity": None, "revenue_growth_yoy": None,
             "market_cap": None, "sector": None, "volatility_30d_pct": None,
-            "ev_to_ebitda": None, "price_to_book": None, "data_source": "yfinance",
+            "ev_to_ebitda": None, "price_to_book": None, "avg_volume": info.get("averageVolume"), "data_source": "yfinance",
         }
 
     if not hist.empty:

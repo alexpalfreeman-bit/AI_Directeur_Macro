@@ -9,7 +9,7 @@ from config.settings import settings
 from src.schemas.thesis import MacroThesis, TickerHealth, QuantValidation
 from src.ingestion.market_client import get_fundamentals
 from src.agents.tool_helper import appel_avec_retry
-
+from config.settings import settings
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -41,13 +41,52 @@ def fetch_real_data(tickers: list[str]) -> list[TickerHealth]:
             volatility_30d_pct=raw.get("volatility_30d_pct"),
             ev_to_ebitda=raw.get("ev_to_ebitda"),       # ← AJOUTE
             price_to_book=raw.get("price_to_book"),      # ← AJOUTE
+            avg_volume=raw.get("avg_volume"),
         ))
     return out
 
+def filtrer_qualite(real_data: list) -> tuple[list, list]:
+    """
+    Écarte les tickers trop petits ou trop peu liquides, en utilisant les
+    données DÉJÀ récupérées (aucun nouvel appel API).
+    """
+    retenus, rejets = [], []
+    for t in real_data:
+        cap = t.market_cap
+        vol = t.avg_volume
+
+        if cap is None or vol is None:
+            # Donnée manquante : on NE rejette PAS (on laisse le LLM juger),
+            # car yfinance est parfois capricieux sur un champ isolé.
+            retenus.append(t)
+            continue
+        if cap < settings.min_market_cap:
+            rejets.append(f"{t.ticker} : capitalisation trop faible ({cap/1e6:.0f}M$)")
+            continue
+        if vol < settings.min_avg_volume:
+            rejets.append(f"{t.ticker} : volume trop faible ({vol:,})")
+            continue
+        retenus.append(t)
+    return retenus, rejets
 
 def validate_thesis(thesis: MacroThesis) -> tuple[list[TickerHealth], QuantValidation]:
     # 1) Les VRAIS chiffres (API, pas LLM)
     real_data = fetch_real_data(thesis.candidate_tickers)
+    # Filtre de qualité/liquidité AVANT le jugement du LLM
+    real_data, rejets_qualite = filtrer_qualite(real_data)
+    for motif in rejets_qualite:
+        print(f"  🚫 Écarté (qualité) : {motif}")
+
+    # Si plus aucun ticker ne passe le filtre, inutile d'appeler le LLM
+    if not real_data:
+        return [], QuantValidation(
+            thesis_id=thesis.thesis_id,
+            verdict="rejected",
+            surviving_tickers=[],
+            market_already_pricing_in=False,
+            quant_notes="Tous les tickers écartés par le filtre de qualité/liquidité.",
+        )
+    
     data_text = "\n".join(
         f"- {t.ticker} ({t.name}) : prix={t.price}, PE={t.pe_ratio}, "
         f"EV/EBITDA={t.ev_to_ebitda}, P/B={t.price_to_book}, "

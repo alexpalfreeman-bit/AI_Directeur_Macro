@@ -55,6 +55,7 @@ class TickerHealth(BaseModel):
     volatility_30d_pct: float | None = None
     ev_to_ebitda: float | None = None      # ← AJOUTE cette ligne
     price_to_book: float | None = None     # ← AJOUTE cette ligne
+    avg_volume: int | None = None
     data_source: str = "yfinance"
 
 
