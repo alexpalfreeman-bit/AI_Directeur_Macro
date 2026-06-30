@@ -26,7 +26,10 @@ _url = os.getenv("UPSTASH_REDIS_REST_URL")
 _token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 if _url and _token:
     _redis = Redis(url=_url, token=_token)
-
+if _redis is not None:
+    print("✅ Redis (Upstash) ACTIVÉ — le portefeuille sera persistant.")
+else:
+    print("⚠️ Redis NON configuré (variables absentes) — repli sur fichier local.")
 PORTFOLIO_KEY = "portfolio"
 
 def _now() -> str:
