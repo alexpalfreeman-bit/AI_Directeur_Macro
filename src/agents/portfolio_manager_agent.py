@@ -16,6 +16,8 @@ from src.ingestion.market_client import get_fundamentals
 from src.memory.vector_store import recall_similar, remember_decision
 from src.communication.telegram_bot import send_decision_et_portefeuille
 from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text
+from src.ingestion.sentiment_client import get_market_regime, regime_text
+
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -63,6 +65,13 @@ Tes principes :
    recommander de la VENDRE plutôt que d'en ouvrir une opposée. Le portefeuille est un
    tout cohérent, pas une collection de paris isolés.
 
+8. TIENS COMPTE DU RÉGIME DE MARCHÉ. On te fournit le régime actuel (RISK-ON / NEUTRE
+   / RISK-OFF), basé sur le VIX, la courbe des taux et la tendance du S&P 500. En
+   RISK-OFF, réduis fortement la taille des positions cycliques (matières premières,
+   industriels, small caps) ou passe en WATCHLIST : un repli général peut les écraser
+   malgré de bons fondamentaux. En RISK-ON, tu peux être plus offensif. Le bon trade
+   au mauvais moment du cycle reste un mauvais trade.
+
 Sois concis et décisif. Tu n'écris pas un essai : tu donnes un ordre clair."""
 
 
@@ -84,6 +93,8 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
     else:
         positions_actuelles = "Aucune position ouverte (portefeuille 100% liquide)."
     capital_dispo = f"{pf.cash:.0f}$ de liquidités sur {pf.starting_capital:.0f}$"
+    regime = get_market_regime()
+    regime_txt = regime_text(regime)
 
     now = datetime.now()
     tool = {
@@ -111,6 +122,7 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
                 f"PROFIL DE RISQUE : {PROFILS_RISQUE[settings.risk_profile]}\n\n"
                 f"⚠️ PORTEFEUILLE ACTUEL (tiens-en compte !) :\n{positions_actuelles}\n"
                 f"Liquidités disponibles : {capital_dispo}\n\n"
+                f"{regime_txt}\n\n"
                 f"PRIX ACTUELS DES SURVIVANTS :\n{prix_actuels}\n\n"
                 f"MÉMOIRE — décisions passées similaires :\n{memoire_text}\n\n"
                 f"--- THÈSE (Macro) ---\n{thesis.model_dump_json(indent=2)}\n\n"
