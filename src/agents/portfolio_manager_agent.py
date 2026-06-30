@@ -110,7 +110,7 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
     )
 
     response = client.messages.create(
-        model=settings.llm_model,
+        model=settings.director_model, ##### SI TROP CHERE CHANGER POUR settings.llm_model roule en 4-5
         max_tokens=1500,
         system=SYSTEM_PROMPT,
         tools=[tool],

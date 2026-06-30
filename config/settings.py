@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     # ── Choix des modèles ──
     llm_model: str = "claude-sonnet-4-6"             # raisonnement (les agents)
     cheap_model: str = "claude-haiku-4-5-20251001"   # bon marché (filtrage des news)
+    director_model: str = "claude-opus-4-5"   # le jugement final mérite le meilleur modèle
 
     # ── Règles métier ──
     paper_trading: bool = True                        # TOUJOURS True au début
