@@ -43,13 +43,18 @@ def appel_avec_retry(client, model, system, user_content, tool_name,
             return schema(**{**data, **forcer_id})   # ✅ validé et complet
         except ValidationError as e:
             derniere_erreur = str(e)
-            # On renvoie l'erreur au modèle pour qu'il corrige au prochain essai
+            # On renvoie l'erreur au modèle via un tool_result (OBLIGATOIRE après un tool_use)
             messages.append({"role": "assistant", "content": [block]})
-            messages.append({"role": "user", "content": (
-                f"Ta réponse était incomplète ou invalide :\n{e}\n\n"
-                f"Refais l'appel à '{tool_name}' en remplissant TOUS les champs requis."
-            )})
-            print(f"  🔄 Quant : essai {essai} incomplet, on redemande...")
+            messages.append({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "is_error": True,
+                "content": (
+                    f"Ta réponse était incomplète ou invalide :\n{e}\n\n"
+                    f"Refais l'appel à '{tool_name}' en remplissant TOUS les champs requis."
+                ),
+            }]})
+            print(f"  🔄 {tool_name} : essai {essai} incomplet, on redemande...")
 
     # Si après tous les essais c'est toujours invalide, on lève l'erreur clairement
     raise ValueError(f"Échec après {max_essais} essais. Dernière erreur : {derniere_erreur}")

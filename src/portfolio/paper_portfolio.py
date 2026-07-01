@@ -43,6 +43,7 @@ class Position(BaseModel):
     stop_loss: float | None = None
     profit_target: float | None = None
     thesis_id: str = ""
+    thesis_summary: str = ""
     opened_at: str = Field(default_factory=_now)
 
 
@@ -98,7 +99,8 @@ def save_portfolio(p: Portfolio) -> None:
 
 # ─── Acheter (paper) ───
 def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
-        stop_loss: float | None, profit_target: float | None, thesis_id: str = "") -> str:
+        stop_loss: float | None, profit_target: float | None, 
+        thesis_id: str = "", thesis_summary: str = "") -> str:
     if any(pos.ticker == ticker for pos in p.positions):
         return f"  ↪ {ticker} déjà en portefeuille — on n'ajoute pas."
     if not price or price <= 0:
@@ -110,7 +112,8 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
     p.cash -= dollars
     p.positions.append(Position(
         ticker=ticker, shares=shares, entry_price=price,
-        stop_loss=stop_loss, profit_target=profit_target, thesis_id=thesis_id,
+        stop_loss=stop_loss, profit_target=profit_target,
+        thesis_id=thesis_id, thesis_summary=thesis_summary,
     ))
     return f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ ({dollars:.0f}$ = {size_pct}%)"
 
@@ -127,6 +130,24 @@ def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) 
     signe = "+" if pnl >= 0 else ""
     return f"  💰 VENTE {pos.ticker} @ {exit_price}$ ({reason}) → P&L {signe}{pnl}$"
 
+def trim_position(p: Portfolio, pos: Position, exit_price: float,
+                  fraction: float = 0.5, reason: str = "alleger") -> str:
+    """Vend une FRACTION d'une position (moitié par défaut) et garde le reste."""
+    shares_vendues = round(pos.shares * fraction, 4)
+    if shares_vendues <= 0 or not exit_price:
+        return f"  ↪ {pos.ticker} : rien à alléger."
+    pnl = round((exit_price - pos.entry_price) * shares_vendues, 2)
+    p.cash += shares_vendues * exit_price
+    p.closed.append(ClosedPosition(
+        ticker=pos.ticker, shares=shares_vendues, entry_price=pos.entry_price,
+        exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
+    ))
+    pos.shares = round(pos.shares - shares_vendues, 4)
+    signe = "+" if pnl >= 0 else ""
+    ligne = f"🔻 ALLÈGE {pos.ticker} : -{shares_vendues} actions @ {exit_price}$ → P&L {signe}{pnl}$"
+    if pos.shares <= 0:              # sécurité : si tout est parti, on retire la position
+        p.positions.remove(pos)
+    return ligne
 
 # ─── Vérifier les sorties (stop-loss / objectif touchés) ───
 def check_exits(p: Portfolio) -> list[str]:
@@ -208,8 +229,9 @@ def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[st
     if decision.action.value == "execute":   # 2) puis les nouveaux achats
         for pos in decision.positions:
             if pos.position_size_pct and pos.position_size_pct > 0 and pos.entry_price:
+                resume = f"{thesis.theme} | {pos.rationale[:200]}"
                 log.append(buy(p, pos.ticker, pos.entry_price, pos.position_size_pct,
-                               pos.stop_loss, pos.profit_target, thesis.thesis_id))
+                               pos.stop_loss, pos.profit_target, thesis.thesis_id, resume))
     else:
         log.append(f"  ↪ Décision {decision.action.value.upper()} : aucune position ouverte.")
 

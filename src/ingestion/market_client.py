@@ -19,7 +19,12 @@ def get_fundamentals(ticker: str) -> dict:
 
     # 🛡️ Filet de sécurité : un ticker invalide/exotique ne doit JAMAIS tout faire planter
     try:
-        info = t.info
+        try:
+            info = t.info
+        except Exception:
+            import time
+            time.sleep(1.5)          # petite pause, puis on retente une fois
+            info = t.info
         hist = t.history(period="1mo")
     except Exception as e:
         print(f"  ⚠️  Données indisponibles pour {ticker} ({e}) — ticker ignoré.")
@@ -27,7 +32,7 @@ def get_fundamentals(ticker: str) -> dict:
             "ticker": ticker.upper(), "name": None, "price": None,
             "pe_ratio": None, "debt_to_equity": None, "revenue_growth_yoy": None,
             "market_cap": None, "sector": None, "volatility_30d_pct": None,
-            "ev_to_ebitda": None, "price_to_book": None, "avg_volume": info.get("averageVolume"), "data_source": "yfinance",
+            "ev_to_ebitda": None, "price_to_book": None, "avg_volume": None, "data_source": "indisponible",
         }
 
     if not hist.empty:

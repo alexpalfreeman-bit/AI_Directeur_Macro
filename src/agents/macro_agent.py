@@ -7,6 +7,7 @@ STRUCTURÉE et VALIDÉE, centrée sur les effets de 2e/3e ordre.
 import anthropic
 from config.settings import settings
 from src.schemas.thesis import MacroThesis
+from src.agents.tool_helper import appel_avec_retry
 
 from datetime import datetime
 
@@ -64,40 +65,25 @@ un pari important sur un événement non corroboré.
 
 def generate_thesis(news_context: str) -> MacroThesis:
     """Produit une MacroThesis validée à partir d'un contexte d'actualités."""
-    # On génère automatiquement le 'moule' JSON depuis Pydantic, et on le donne
-    # à Claude comme un OUTIL qu'il est forcé d'utiliser. Sortie structurée garantie.
-    tool = {
-        "name": "soumettre_these",
-        "description": "Soumet une thèse d'investissement macro structurée.",
-        "input_schema": MacroThesis.model_json_schema(),
-    }
-
-    response = client.messages.create(
-        model=settings.llm_model,
-        max_tokens=1500,
-        system=f"{contexte_temporel()}\n\n{SYSTEM_PROMPT}",
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "soumettre_these"},  # on FORCE l'outil
-        messages=[{
-            "role": "user",
-            "content": (
-                "Voici les actualités macro du moment. Identifie l'opportunité "
-                "de 2e/3e ordre la plus prometteuse et soumets ta thèse via l'outil.\n\n"
-                f"--- ACTUALITÉS ---\n{news_context}"
-            ),
-        }],
+    user_content = (
+        "Voici les actualités macro du moment. Identifie l'opportunité "
+        "de 2e/3e ordre la plus prometteuse et soumets ta thèse via l'outil "
+        "'soumettre_these'. Remplis TOUS les champs requis (dont 'rationale' et "
+        "'confidence').\n\n"
+        f"--- ACTUALITÉS ---\n{news_context}"
     )
 
-    # On extrait le bloc 'tool_use' rempli par Claude
-    tool_block = next(b for b in response.content if b.type == "tool_use")
-    data = dict(tool_block.input)
-
-    # L'id et la date sont générés par Python, pas par Claude
-    data.pop("thesis_id", None)
-    data.pop("created_at", None)
-
-    # 🛡️ Validation finale : si la sortie est invalide, l'erreur saute ICI
-    return MacroThesis(**data)
+    # 🛡️ Sortie structurée + retry automatique si un champ manque (rationale, confidence…)
+    thesis = appel_avec_retry(
+        client=client,
+        model=settings.llm_model,
+        system=f"{contexte_temporel()}\n\n{SYSTEM_PROMPT}",
+        user_content=user_content,
+        tool_name="soumettre_these",
+        schema=MacroThesis,
+        max_tokens=1500,
+    )
+    return thesis
 
 
 if __name__ == "__main__":
