@@ -14,6 +14,7 @@ from src.agents.portfolio_manager_agent import make_decision
 from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text
 from src.communication.telegram_bot import send_decision_et_portefeuille, send_text
 from src.ingestion.news_client import fetch_headlines, is_macro_relevant, corroborer_actualites
+from datetime import datetime, timezone
 
 def construire_contexte_actu(max_titres: int = 8) -> str:
     """Récupère les vraies actualités et garde celles qui sont macro-pertinentes."""
@@ -100,13 +101,19 @@ def revue_gerant(contexte_actu: str = "") -> None:
         print("   Mouvements du Gérant envoyés sur Telegram.")
 
 def run_once() -> None:
-    """Un cycle complet : gestion des positions ouvertes, puis recherche de nouvelles idées."""
+    """Cycle complet. Le soir (17h), on révise d'abord les positions ; puis on cherche des idées."""
     contexte = construire_contexte_actu()
-    revue_gerant(contexte)          # ← 1) on gère d'abord ce qu'on détient (Reconcile/Manage)
+
+    # 📋 Revue du portefeuille UNE fois par jour, sur le cycle du soir (17h Montréal = 21h UTC).
+    #    Les cycles du matin/midi ne cherchent que de nouvelles idées.
+    #    (Le stop-loss mécanique, lui, continue de protéger à chaque cycle via check_exits.)
+    if datetime.now(timezone.utc).hour >= 20:
+        revue_gerant(contexte)
+
     if not contexte:
         print("   Aucune actualité macro significative — pas de nouvelle idée aujourd'hui.")
         return
-    lancer_comite(contexte)         # ← 2) puis on cherche de nouvelles idées
+    lancer_comite(contexte)
 
 def run_screener() -> None:
     """Cycle BOTTOM-UP : screener → thèse → comité → portefeuille → Telegram."""
