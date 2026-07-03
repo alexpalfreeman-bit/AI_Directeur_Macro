@@ -234,8 +234,8 @@ def snapshot_text(p: Portfolio) -> str:
         pnl_r = sum(c.realized_pnl for c in p.closed)
         s = "+" if pnl_r >= 0 else ""
         lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L réalisé {s}{pnl_r:.0f}$")
-        # Comparaison avec le S&P 500
-# Comparaison avec le S&P 500 (avec rattrapage si le prix de départ manque)
+
+    # Comparaison avec le S&P 500 (avec rattrapage si le prix de départ manque)
     if not p.spy_start_price:
         spy_init = get_fundamentals("SPY").get("price")
         if spy_init:
@@ -352,6 +352,73 @@ def tenter_arbitrage(p: Portfolio, plan) -> tuple[bool, list[str]]:
     return True, log
 
 
+# ─── Arbitrage sectoriel ───
+def _headroom_secteur(p: Portfolio, secteur: str) -> float:
+    """Place restante (en $) dans un secteur avant d'atteindre le plafond."""
+    plafond = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * p.starting_capital
+    expo = sum(pos.shares * pos.entry_price for pos in p.positions if pos.sector == secteur)
+    return plafond - expo
+
+
+def tenter_arbitrage_sectoriel(p: Portfolio, plan, secteur: str) -> tuple[bool, list[str]]:
+    """
+    Rotation INTRA-secteur : quand un secteur est plein, vend sa position la plus
+    FAIBLE pour financer une nouvelle idée nettement plus forte DU MÊME secteur.
+    Ne touche JAMAIS une position d'un autre secteur. Renvoie (rotation_effectuee, journal).
+    """
+    log: list[str] = []
+    if not _ARB_ACTIF or not secteur:
+        return False, log
+
+    conv_cible = getattr(plan, "conviction", None)
+    if conv_cible is None:
+        return False, log
+
+    cout_cible = (min(plan.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
+    plafond_secteur = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * p.starting_capital
+
+    # Candidats : MÊME secteur, conviction connue, assez anciens, ticker différent
+    candidats = [
+        pos for pos in p.positions
+        if pos.sector == secteur and pos.conviction is not None
+        and pos.ticker != plan.ticker and _age_jours(pos) >= _ARB_MIN_JOURS
+    ]
+    if not candidats:
+        log.append(f"  ↪ Arbitrage sectoriel « {secteur} » impossible : aucune position éligible dans ce secteur.")
+        return False, log
+
+    prix_courants = {pos.ticker: get_fundamentals(pos.ticker).get("price") for pos in candidats}
+    faible = min(candidats, key=lambda pos: (
+        pos.conviction, _proximite_invalidation(pos, prix_courants.get(pos.ticker))
+    ))
+
+    ecart = conv_cible - faible.conviction
+    if ecart < _ARB_MIN_EDGE:
+        log.append(f"  ↪ Arbitrage sectoriel écarté : {plan.ticker} ({conv_cible:.2f}) pas assez "
+                   f"supérieure à {faible.ticker} ({faible.conviction:.2f}) — écart {ecart:.2f} < {_ARB_MIN_EDGE:.2f}.")
+        return False, log
+
+    prix_faible = prix_courants.get(faible.ticker)
+    if not prix_faible or prix_faible <= 0:
+        log.append(f"  ↪ Arbitrage sectoriel annulé : prix indisponible pour {faible.ticker}.")
+        return False, log
+
+    # La vente doit débloquer À LA FOIS assez de place SECTEUR et assez de CASH pour la cible
+    cout_faible = faible.shares * faible.entry_price          # base de coût = place secteur libérée
+    expo_secteur = sum(pos.shares * pos.entry_price for pos in p.positions if pos.sector == secteur)
+    headroom_apres = plafond_secteur - (expo_secteur - cout_faible)
+    cash_apres = p.cash + faible.shares * prix_faible
+    if headroom_apres < cout_cible or cash_apres < cout_cible:
+        log.append(f"  ↪ Arbitrage sectoriel écarté : vendre {faible.ticker} ne libère pas assez "
+                   f"(secteur {headroom_apres:.0f}$ / cash {cash_apres:.0f}$ vs {cout_cible:.0f}$ requis).")
+        return False, log
+
+    log.append("  🔄 ARBITRAGE SECTORIEL — " + close_position(p, faible, prix_faible, "arbitrage_sectoriel"))
+    log.append(f"     → place réallouée dans « {secteur} » vers {plan.ticker} "
+               f"(conviction {conv_cible:.2f} vs {faible.conviction:.2f} sacrifiée).")
+    return True, log
+
+
 # ─── Enregistrer une décision du Directeur ───
 def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[str]:
     """Vérifie les sorties, puis achète si la décision est EXECUTE. Renvoie un journal."""
@@ -359,16 +426,24 @@ def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[st
     log = check_exits(p)            # 1) on gère d'abord les sorties existantes
 
     if decision.action.value == "execute":   # 2) puis les nouveaux achats
-        rotation_utilisee = False   # 🔄 au plus UNE rotation d'arbitrage par cycle
+        rotation_utilisee = False   # 🔄 au plus UNE rotation par cycle (sectorielle OU capital)
         for pos in decision.positions:
             if pos.position_size_pct and pos.position_size_pct > 0 and pos.entry_price:
-                # 🔄 Cash suffisant ? Sinon on tente UN arbitrage : vendre la position
-                #    la plus faible pour financer CETTE idée-ci.
                 cout = (min(pos.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
-                if cout > p.cash and not rotation_utilisee:
-                    rotation_faite, journal_arb = tenter_arbitrage(p, pos)
+
+                # 🔄 1) Le SECTEUR bloque-t-il ? -> rotation INTRA-secteur (vend la faible du secteur)
+                if (not rotation_utilisee and thesis.sector
+                        and _headroom_secteur(p, thesis.sector) < cout):
+                    faite, journal_arb = tenter_arbitrage_sectoriel(p, pos, thesis.sector)
                     log.extend(journal_arb)
-                    if rotation_faite:
+                    if faite:
+                        rotation_utilisee = True
+
+                # 🔄 2) Sinon le CASH bloque-t-il ? -> rotation portefeuille (vend la plus faible globale)
+                if not rotation_utilisee and cout > p.cash:
+                    faite, journal_arb = tenter_arbitrage(p, pos)
+                    log.extend(journal_arb)
+                    if faite:
                         rotation_utilisee = True
 
                 resume = f"{thesis.theme} | {pos.rationale[:200]}"
