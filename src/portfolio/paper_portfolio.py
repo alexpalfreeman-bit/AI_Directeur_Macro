@@ -42,6 +42,9 @@ class Position(BaseModel):
     entry_price: float
     stop_loss: float | None = None
     profit_target: float | None = None
+    invalidation_price: float | None = None
+    conviction: float | None = None          # ← conviction du Directeur (0-1), sert à l'arbitrage
+    sector: str = ""                         # ← secteur de la thèse, pour le plafond de diversification
     thesis_id: str = ""
     thesis_summary: str = ""
     opened_at: str = Field(default_factory=_now)
@@ -99,13 +102,33 @@ def save_portfolio(p: Portfolio) -> None:
 
 # ─── Acheter (paper) ───
 def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
-        stop_loss: float | None, profit_target: float | None, 
-        thesis_id: str = "", thesis_summary: str = "") -> str:
+        stop_loss: float | None, profit_target: float | None,
+        thesis_id: str = "", thesis_summary: str = "",
+        invalidation_price: float | None = None,
+        conviction: float | None = None, sector: str = "") -> str:
     if any(pos.ticker == ticker for pos in p.positions):
         return f"  ↪ {ticker} déjà en portefeuille — on n'ajoute pas."
     if not price or price <= 0:
         return f"  ↪ Prix indisponible pour {ticker} — achat annulé."
     dollars = (size_pct / 100.0) * p.starting_capital
+
+    # 🛡️ Plafond par TITRE : aucun titre ne dépasse le plafond, quoi que dise le Directeur
+    plafond_dollars = (settings.max_position_pct / 100.0) * p.starting_capital
+    if dollars > plafond_dollars:
+        dollars = plafond_dollars
+
+    # 🛡️ Plafond par SECTEUR : on ne surconcentre pas un même thème macro
+    if sector:
+        plafond_secteur = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * p.starting_capital
+        expo_secteur = sum(pos.shares * pos.entry_price
+                           for pos in p.positions if pos.sector == sector)
+        headroom = plafond_secteur - expo_secteur
+        if headroom <= 0:
+            return (f"  ↪ Plafond secteur « {sector} » atteint "
+                    f"({expo_secteur:.0f}$/{plafond_secteur:.0f}$) — {ticker} écarté.")
+        if dollars > headroom:
+            dollars = headroom   # on écrête à la place restante dans le secteur
+
     if dollars > p.cash:
         return f"  ↪ Cash insuffisant pour {ticker} ({dollars:.0f}$ demandés, {p.cash:.0f}$ dispo)."
     shares = round(dollars / price, 4)
@@ -114,9 +137,10 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         ticker=ticker, shares=shares, entry_price=price,
         stop_loss=stop_loss, profit_target=profit_target,
         thesis_id=thesis_id, thesis_summary=thesis_summary,
+        invalidation_price=invalidation_price,
+        conviction=conviction, sector=sector,
     ))
     return f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ ({dollars:.0f}$ = {size_pct}%)"
-
 
 # ─── Clôturer une position ───
 def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) -> str:
@@ -158,10 +182,24 @@ def check_exits(p: Portfolio) -> list[str]:
             continue
         if pos.stop_loss and price <= pos.stop_loss:
             alerts.append("🛑 STOP touché ! " + close_position(p, pos, price, "stop_loss"))
+        elif pos.invalidation_price and price <= pos.invalidation_price:
+            alerts.append("❌ THÈSE INVALIDÉE ! " + close_position(p, pos, price, "these_invalidee"))
         elif pos.profit_target and price >= pos.profit_target:
             alerts.append("🎯 OBJECTIF atteint ! " + close_position(p, pos, price, "profit_target"))
     return alerts
 
+def verifier_sorties() -> list[str]:
+    """
+    Protection mécanique indépendante : charge le portefeuille, vérifie stops /
+    invalidation / objectifs sur TOUTES les positions ouvertes, applique les sorties
+    déclenchées et sauvegarde. À appeler à CHAQUE cycle, sans attendre une décision.
+    Renvoie le journal des sorties (vide si rien ne s'est déclenché).
+    """
+    p = load_portfolio()
+    sorties = check_exits(p)
+    if sorties:
+        save_portfolio(p)
+    return sorties
 
 # ─── Photo du portefeuille (valeur + performance) ───
 def snapshot_text(p: Portfolio) -> str:
@@ -220,6 +258,100 @@ def snapshot_text(p: Portfolio) -> str:
     return "\n".join(lignes)
 
 
+# ─── Arbitrage de capital ───
+# Quand le cash manque pour financer une nouvelle idée FORTE, on vend la position
+# détenue la plus FAIBLE (conviction la plus basse) pour libérer le capital — mais
+# seulement si l'écart de conviction est NET, si la position est assez ANCIENNE, et
+# si la vente libère VRAIMENT assez de cash. Sinon, on ne touche à rien (pas de churn).
+# Réglages surchargés par config/settings.py s'ils y sont définis (sinon, défauts sûrs).
+_ARB_ACTIF = getattr(settings, "arbitrage_actif", True)
+_ARB_MIN_EDGE = getattr(settings, "arbitrage_min_edge", 0.15)        # écart de conviction min (échelle 0-1)
+_ARB_MIN_JOURS = getattr(settings, "arbitrage_min_holding_days", 3)  # âge min avant de pouvoir sacrifier
+
+def _age_jours(pos: Position) -> float:
+    """Nombre de jours depuis l'ouverture de la position."""
+    try:
+        ouverture = datetime.fromisoformat(pos.opened_at)
+        if ouverture.tzinfo is None:
+            ouverture = ouverture.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return 1e9   # date illisible → traitée comme très ancienne (donc éligible)
+    return (datetime.now(timezone.utc) - ouverture).total_seconds() / 86400.0
+
+def _proximite_invalidation(pos: Position, prix: float | None) -> float:
+    """
+    Fragilité fondamentale : marge relative jusqu'au prix d'invalidation.
+    Plus PETIT = plus proche de l'invalidation = plus fragile. Renvoie 1.0 si
+    non défini. Sert uniquement de DÉPARTAGE entre deux convictions égales.
+    """
+    if not pos.invalidation_price or not prix or prix <= 0:
+        return 1.0
+    return max(0.0, min(1.0, (prix - pos.invalidation_price) / prix))
+
+def tenter_arbitrage(p: Portfolio, plan) -> tuple[bool, list[str]]:
+    """
+    Tente UNE rotation de capital pour financer `plan` (un PositionPlan du Directeur) :
+    vend la position détenue la plus faible si — et seulement si — toutes les
+    conditions de sécurité sont réunies. Renvoie (rotation_effectuee, journal).
+    """
+    log: list[str] = []
+    if not _ARB_ACTIF:
+        return False, log
+
+    conv_cible = getattr(plan, "conviction", None)
+    if conv_cible is None:
+        return False, log   # sans conviction sur la nouvelle idée, pas d'arbitrage
+
+    # Coût (écrêté au plafond 15 %) de la position visée
+    cout_cible = (min(plan.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
+
+    # Candidats au sacrifice : conviction CONNUE, assez anciens, ticker différent de la cible
+    candidats = [
+        pos for pos in p.positions
+        if pos.conviction is not None
+        and pos.ticker != plan.ticker
+        and _age_jours(pos) >= _ARB_MIN_JOURS
+    ]
+    if not candidats:
+        log.append("  ↪ Arbitrage impossible : aucune position éligible "
+                   "(conviction connue + assez ancienne).")
+        return False, log
+
+    # Prix courants (une seule fois) pour le départage et le calcul du produit de vente
+    prix_courants = {pos.ticker: get_fundamentals(pos.ticker).get("price") for pos in candidats}
+
+    # La plus FAIBLE = conviction la plus basse ; départage par proximité d'invalidation
+    faible = min(candidats, key=lambda pos: (
+        pos.conviction, _proximite_invalidation(pos, prix_courants.get(pos.ticker))
+    ))
+
+    # L'écart de conviction doit être NET (sinon on ne churne pas pour un gain marginal)
+    ecart = conv_cible - faible.conviction
+    if ecart < _ARB_MIN_EDGE:
+        log.append(f"  ↪ Arbitrage écarté : idée {plan.ticker} ({conv_cible:.2f}) pas assez "
+                   f"supérieure à {faible.ticker} ({faible.conviction:.2f}) — "
+                   f"écart {ecart:.2f} < seuil {_ARB_MIN_EDGE:.2f}.")
+        return False, log
+
+    prix_faible = prix_courants.get(faible.ticker)
+    if not prix_faible or prix_faible <= 0:
+        log.append(f"  ↪ Arbitrage annulé : prix indisponible pour {faible.ticker}.")
+        return False, log
+
+    # La vente doit VRAIMENT libérer assez de cash, sinon on vendrait pour rien
+    produit_vente = faible.shares * prix_faible
+    if p.cash + produit_vente < cout_cible:
+        log.append(f"  ↪ Arbitrage écarté : vendre {faible.ticker} ne libère pas assez "
+                   f"({p.cash + produit_vente:.0f}$ dispo < {cout_cible:.0f}$ requis pour {plan.ticker}).")
+        return False, log
+
+    # ✅ Feu vert : on sacrifie la plus faible pour financer la cible
+    log.append("  🔄 ARBITRAGE — " + close_position(p, faible, prix_faible, "arbitrage_capital"))
+    log.append(f"     → capital réalloué vers {plan.ticker} "
+               f"(conviction {conv_cible:.2f} vs {faible.conviction:.2f} sacrifiée).")
+    return True, log
+
+
 # ─── Enregistrer une décision du Directeur ───
 def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[str]:
     """Vérifie les sorties, puis achète si la décision est EXECUTE. Renvoie un journal."""
@@ -227,11 +359,24 @@ def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[st
     log = check_exits(p)            # 1) on gère d'abord les sorties existantes
 
     if decision.action.value == "execute":   # 2) puis les nouveaux achats
+        rotation_utilisee = False   # 🔄 au plus UNE rotation d'arbitrage par cycle
         for pos in decision.positions:
             if pos.position_size_pct and pos.position_size_pct > 0 and pos.entry_price:
+                # 🔄 Cash suffisant ? Sinon on tente UN arbitrage : vendre la position
+                #    la plus faible pour financer CETTE idée-ci.
+                cout = (min(pos.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
+                if cout > p.cash and not rotation_utilisee:
+                    rotation_faite, journal_arb = tenter_arbitrage(p, pos)
+                    log.extend(journal_arb)
+                    if rotation_faite:
+                        rotation_utilisee = True
+
                 resume = f"{thesis.theme} | {pos.rationale[:200]}"
                 log.append(buy(p, pos.ticker, pos.entry_price, pos.position_size_pct,
-                               pos.stop_loss, pos.profit_target, thesis.thesis_id, resume))
+                               pos.stop_loss, pos.profit_target, thesis.thesis_id, resume,
+                               invalidation_price=pos.invalidation_price,
+                               conviction=pos.conviction,
+                               sector=thesis.sector))
     else:
         log.append(f"  ↪ Décision {decision.action.value.upper()} : aucune position ouverte.")
 

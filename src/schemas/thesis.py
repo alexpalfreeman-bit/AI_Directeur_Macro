@@ -19,6 +19,12 @@ class CatalystType(str, Enum):
     OTHER           = "other"
 
 
+class CatalystNature(str, Enum):
+    REAL       = "real"          # mécanisme causal concret et vérifiable
+    HYPE       = "hype"          # emballement narratif sans fondement solide
+    PRICED_IN  = "priced_in"     # fait réel mais déjà arbitré (effet de 1er ordre)
+
+
 class Direction(str, Enum):
     LONG  = "long"
     SHORT = "short"
@@ -26,8 +32,8 @@ class Direction(str, Enum):
 
 class Catalyst(BaseModel):
     type: CatalystType
+    nature: CatalystNature = CatalystNature.REAL   # ← défaut REAL : protège la voie screener
     description: str
-
 
 class MacroThesis(BaseModel):
     thesis_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -79,7 +85,8 @@ class RiskSeverity(str, Enum):
 class RiskAssessment(BaseModel):
     """Le verdict de l'Avocat du Diable : la thèse survit-elle à la démolition ?"""
     thesis_id: str
-    kill_shot: str = ""                                       # la meilleure tentative de démolition
+    kill_shot: str = ""  
+    invalidation_trigger: str = ""    # fait précis, observable, qui confirme le bear case et tue la thèse                                   # la meilleure tentative de démolition
     macro_regime_risks: list[str] = Field(default_factory=list)      # risk-off, carry trade, cyclicité
     causal_chain_weaknesses: list[str] = Field(default_factory=list) # maillons faibles, sur-ingénierie
     timing_seasonality_risks: list[str] = Field(default_factory=list)# hors-saison vs date du jour

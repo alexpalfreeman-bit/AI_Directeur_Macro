@@ -17,7 +17,8 @@ from src.memory.vector_store import recall_similar, remember_decision
 from src.communication.telegram_bot import send_decision_et_portefeuille
 from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text
 from src.ingestion.sentiment_client import get_market_regime, regime_text
-
+import uuid
+from src.agents.tool_helper import appel_avec_retry
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -71,6 +72,11 @@ Tes principes :
    industriels, small caps) ou passe en WATCHLIST : un repli général peut les écraser
    malgré de bons fondamentaux. En RISK-ON, tu peux être plus offensif. Le bon trade
    au mauvais moment du cycle reste un mauvais trade.
+PRIX D'INVALIDATION (le chiffre qui casse la thèse). Pour CHAQUE position que tu
+EXÉCUTES, remplis aussi `invalidation_price` : le niveau de prix précis EN DESSOUS
+duquel la thèse est prouvée fausse — pas un simple stop de risque, mais le point où
+le marché te donne tort. Il se situe sous le prix d'entrée. Sers-toi des PRIX ACTUELS
+fournis pour le calibrer. Si ce niveau est franchi, on sort sans discuter.
 
 Sois concis et décisif. Tu n'écris pas un essai : tu donnes un ordre clair."""
 
@@ -97,11 +103,6 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
     regime_txt = regime_text(regime)
 
     now = datetime.now()
-    tool = {
-        "name": "rendre_decision",
-        "description": "Rend la décision finale de portefeuille, structurée.",
-        "input_schema": PortfolioDecision.model_json_schema(),
-    }
 
     passe = recall_similar(thesis)
     memoire_text = "Aucune décision passée comparable." if not passe else "\n".join(
@@ -109,47 +110,40 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
         for m in passe
     )
 
-    response = client.messages.create(
-        model=settings.director_model, ##### SI TROP CHERE CHANGER POUR settings.llm_model roule en 4-5
-        max_tokens=1500,
-        system=SYSTEM_PROMPT,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "rendre_decision"},
-        messages=[{
-            "role": "user",
-            "content": (
-                f"DATE DU JOUR : {now.day}/{now.month}/{now.year} (Q{(now.month-1)//3+1}).\n\n"
-                f"PROFIL DE RISQUE : {PROFILS_RISQUE[settings.risk_profile]}\n\n"
-                f"⚠️ PORTEFEUILLE ACTUEL (tiens-en compte !) :\n{positions_actuelles}\n"
-                f"Liquidités disponibles : {capital_dispo}\n\n"
-                f"{regime_txt}\n\n"
-                f"PRIX ACTUELS DES SURVIVANTS :\n{prix_actuels}\n\n"
-                f"MÉMOIRE — décisions passées similaires :\n{memoire_text}\n\n"
-                f"--- THÈSE (Macro) ---\n{thesis.model_dump_json(indent=2)}\n\n"
-                f"--- VALIDATION (Quant) ---\n{quant.model_dump_json(indent=2)}\n\n"
-                f"--- DÉMOLITION (Avocat du Diable) ---\n{risk.model_dump_json(indent=2)}\n\n"
-                "Tranche maintenant via l'outil 'rendre_decision'. Ne retiens que des "
-                "tickers présents dans les survivants du Quant."
-            ),
-        }],
+    user_content = (
+        f"DATE DU JOUR : {now.day}/{now.month}/{now.year} (Q{(now.month-1)//3+1}).\n\n"
+        f"PROFIL DE RISQUE : {PROFILS_RISQUE[settings.risk_profile]}\n\n"
+        f"PLAFOND DUR : aucune position ne peut dépasser {settings.max_position_pct}% "
+        f"du capital. Toute demande au-dessus sera automatiquement écrêtée.\n\n"
+        f"⚠️ PORTEFEUILLE ACTUEL (tiens-en compte !) :\n{positions_actuelles}\n"
+        f"Liquidités disponibles : {capital_dispo}\n\n"
+        f"{regime_txt}\n\n"
+        f"PRIX ACTUELS DES SURVIVANTS :\n{prix_actuels}\n\n"
+        f"MÉMOIRE — décisions passées similaires :\n{memoire_text}\n\n"
+        f"--- THÈSE (Macro) ---\n{thesis.model_dump_json(indent=2)}\n\n"
+        f"--- VALIDATION (Quant) ---\n{quant.model_dump_json(indent=2)}\n\n"
+        f"--- DÉMOLITION (Avocat du Diable) ---\n{risk.model_dump_json(indent=2)}\n\n"
+        "Tranche maintenant via l'outil 'rendre_decision'. Ne retiens que des tickers "
+        "présents dans les survivants du Quant. Remplis TOUS les champs requis (dont "
+        "`action`, `confidence`, et `invalidation_price` pour CHAQUE position exécutée)."
     )
 
-    block = next(b for b in response.content if b.type == "tool_use")
-    data = dict(block.input)
-    data.pop("decision_id", None)
-    data.pop("thesis_id", None)
-    try:
-        decision = PortfolioDecision(thesis_id=thesis.thesis_id, **data)
-    except Exception as e:
-        print(f"  ⚠️  Sortie incomplète du Directeur, défauts appliqués : {e}")
-        data.setdefault("action", "reject")
-        data.setdefault("confidence", 0.0)
-        decision = PortfolioDecision(thesis_id=thesis.thesis_id, **data)
+    # 🛡️ Sortie structurée + retry auto (comme Macro/Quant/Gérant/Avocat).
+    #    On force thesis_id ET un decision_id neuf (on ne fait pas confiance au LLM pour l'id).
+    decision = appel_avec_retry(
+        client=client,
+        model=settings.director_model,   # Opus ; passe à settings.llm_model si trop cher
+        system=SYSTEM_PROMPT,
+        user_content=user_content,
+        tool_name="rendre_decision",
+        schema=PortfolioDecision,
+        max_tokens=1500,
+        forcer_id={"thesis_id": thesis.thesis_id, "decision_id": str(uuid.uuid4())},
+    )
 
     # On mémorise la décision AVANT de la renvoyer
     remember_decision(thesis, decision, regime_tag="a_qualifier")
     return decision
-
 
 if __name__ == "__main__":
     from src.agents.macro_agent import generate_thesis

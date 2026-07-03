@@ -10,6 +10,7 @@ from datetime import datetime
 import anthropic
 from config.settings import settings
 from src.schemas.thesis import MacroThesis, QuantValidation, RiskAssessment
+from src.agents.tool_helper import appel_avec_retry
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -47,45 +48,38 @@ Tes angles d'attaque prioritaires :
 6. QUALITÉ DES DONNÉES. Méfie-toi des données manquantes, des tickers non résolus,
    des analyses qui reposent sur des inputs douteux. Un jugement sur du vide est nul.
 
+7. DÉCLENCHEUR D'INVALIDATION (kill-switch de la thèse). Au-delà de ta démolition, formule UN
+   fait précis, observable et vérifiable qui, s'il se produit, CONFIRME le bear case et tue la
+   thèse (ex. « si le gaz naturel repasse au-dessus de 4 $/MMBtu sous 30 jours », « si la firme
+   perd le contrat X »). Renseigne-le dans le champ `invalidation_trigger`. Il doit être CONCRET
+   et MONITORABLE — jamais une généralité comme « si le marché baisse ». C'est le signal de
+   sortie FACTUEL de la thèse.
+
 À la fin, tranche honnêtement : malgré ta démolition, la thèse SURVIT-elle ? Une
 bonne thèse peut encaisser tes coups. Ne tue pas par principe — tue par raison."""
 
 
 def challenge_thesis(thesis: MacroThesis, quant: QuantValidation) -> RiskAssessment:
     now = datetime.now()
-    tool = {
-        "name": "rendre_evaluation_risque",
-        "description": "Rend une évaluation de risque structurée après démolition.",
-        "input_schema": RiskAssessment.model_json_schema(),
-    }
-    response = client.messages.create(
-        model=settings.llm_model,
-        max_tokens=1500,
-        system=SYSTEM_PROMPT,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "rendre_evaluation_risque"},
-        messages=[{
-            "role": "user",
-            "content": (
-                f"DATE DU JOUR : {now.day}/{now.month}/{now.year} (trimestre Q{(now.month-1)//3+1}).\n\n"
-                f"THÈSE À DÉTRUIRE :\n{thesis.model_dump_json(indent=2)}\n\n"
-                f"VALIDATION DU QUANT (chiffres réels + verdict) :\n{quant.model_dump_json(indent=2)}\n\n"
-                "Démolis cette thèse via l'outil 'rendre_evaluation_risque'."
-            ),
-        }],
+    user_content = (
+        f"DATE DU JOUR : {now.day}/{now.month}/{now.year} (trimestre Q{(now.month-1)//3+1}).\n\n"
+        f"THÈSE À DÉTRUIRE :\n{thesis.model_dump_json(indent=2)}\n\n"
+        f"VALIDATION DU QUANT (chiffres réels + verdict) :\n{quant.model_dump_json(indent=2)}\n\n"
+        "Démolis cette thèse via l'outil 'rendre_evaluation_risque'. Remplis TOUS les champs "
+        "(dont `severity`, `survives_scrutiny` et `invalidation_trigger`)."
     )
 
-    block = next(b for b in response.content if b.type == "tool_use")
-    data = dict(block.input)
-    data.pop("thesis_id", None)
-    try:
-        return RiskAssessment(thesis_id=thesis.thesis_id, **data)
-    except Exception as e:
-        print(f"  ⚠️  Sortie incomplète de l'Avocat du Diable, défauts appliqués : {e}")
-        data.setdefault("severity", "serious")
-        data.setdefault("survives_scrutiny", False)
-        return RiskAssessment(thesis_id=thesis.thesis_id, **data)
-
+    # 🛡️ Sortie structurée + retry auto si un champ manque (comme Macro/Quant/Gérant)
+    return appel_avec_retry(
+        client=client,
+        model=settings.llm_model,
+        system=SYSTEM_PROMPT,
+        user_content=user_content,
+        tool_name="rendre_evaluation_risque",
+        schema=RiskAssessment,
+        max_tokens=1500,
+        forcer_id={"thesis_id": thesis.thesis_id},   # on impose le bon id, comme le Quant
+    )
 
 if __name__ == "__main__":
     from src.agents.macro_agent import generate_thesis

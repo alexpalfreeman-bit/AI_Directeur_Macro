@@ -20,6 +20,7 @@ class PositionPlan(BaseModel):
     entry_price: float | None = None
     profit_target: float | None = None
     stop_loss: float | None = None
+    invalidation_price: float | None = None
     rationale: str = ""
 
 

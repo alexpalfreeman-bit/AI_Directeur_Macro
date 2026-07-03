@@ -25,4 +25,10 @@ class Settings(BaseSettings):
     min_market_cap: float = 500_000_000      # 500 M$ : on évite les nano/micro-caps fragiles
     min_avg_volume: int = 300_000             # 300k actions/jour : liquidité minimale
 
+    max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
+    max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)
+    arbitrage_actif: bool = True
+    arbitrage_min_edge: float = 0.15          # écart de conviction min (0-1) idée vs plus faible détenue
+    arbitrage_min_holding_days: int = 3       # jamais sacrifier une position ouverte depuis < N jours
+
 settings = Settings()   # cet objet `settings` sera importé partout dans le projet

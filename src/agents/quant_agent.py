@@ -26,7 +26,17 @@ Tu n'inventes aucune donnée. Si un chiffre est absent (null), signale-le, ne de
 ATTENTION AUX CYCLIQUES : sur un producteur de matières premières, le PE instantané
 est trompeur. Un PE bas peut signaler un PIC de bénéfices (sommet de cycle = cher),
 un PE élevé un CREUX (potentiel plancher). Privilégie l'EV/EBITDA et le Price-to-Book
-pour juger la valorisation de ces titres, et croise toujours avec le PE."""
+pour juger la valorisation de ces titres, et croise toujours avec le PE.
+
+FILTRE VALUE-TRAP (piège de valeur) : une action bon marché n'est pas forcément une aubaine.
+Avant de laisser survivre un ticker sur un argument de faible valorisation (PE, P/B ou
+EV/EBITDA bas), demande-toi si ce bas prix est MÉRITÉ : déclin structurel du secteur, érosion
+durable des marges, endettement qui s'aggrave, désavantage concurrentiel permanent ou
+obsolescence. Distingue « injustement puni » (edge réel) de « bon marché pour une bonne
+raison » (piège). Un ratio bas COUPLÉ à des fondamentaux qui se dégradent (dette/capitaux
+élevée, rentabilité en berne) est un signal de PIÈGE, pas d'opportunité : dans le doute,
+rejette le ticker et explique-le dans `quant_notes`.
+"""
 
 
 def fetch_real_data(tickers: list[str]) -> list[TickerHealth]:

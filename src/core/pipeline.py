@@ -11,10 +11,40 @@ from src.agents.macro_agent import generate_thesis
 from src.agents.quant_agent import validate_thesis
 from src.agents.devils_advocate_agent import challenge_thesis
 from src.agents.portfolio_manager_agent import make_decision
-from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text
+from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text, verifier_sorties
 from src.communication.telegram_bot import send_decision_et_portefeuille, send_text
 from src.ingestion.news_client import fetch_headlines, is_macro_relevant, corroborer_actualites
 from datetime import datetime, timezone
+from src.memory.world_memory import enregistrer_evenement
+import traceback
+
+def executer_en_securite(nom_etape: str, fonction, *args, **kwargs):
+    """
+    Exécute une étape du pipeline en ISOLANT ses erreurs : si elle plante, on
+    journalise la trace complète (pour débugger), on alerte sur Telegram, et on
+    renvoie None pour laisser le RESTE du cycle continuer.
+    """
+    try:
+        return fonction(*args, **kwargs)
+    except Exception as e:
+        print(f"❌ Étape « {nom_etape} » a échoué : {e}")
+        print(traceback.format_exc())
+        try:
+            asyncio.run(send_text(f"⚠️ ERREUR pipeline — étape « {nom_etape} » :\n{e}"))
+        except Exception as e_tel:
+            print(f"   (Alerte Telegram impossible : {e_tel})")
+        return None
+
+def verifier_et_alerter_sorties() -> None:
+    """Vérifie les sorties mécaniques et, s'il y en a, prévient sur Telegram."""
+    sorties = verifier_sorties()
+    if not sorties:
+        return
+    for ligne in sorties:
+        print(ligne)
+    texte = "🛡️ SORTIES AUTOMATIQUES (stop / invalidation / objectif) :\n\n" + "\n".join(sorties)
+    texte += "\n\n" + snapshot_text(load_portfolio())
+    asyncio.run(send_text(texte))
 
 def construire_contexte_actu(max_titres: int = 8) -> str:
     """Récupère les vraies actualités et garde celles qui sont macro-pertinentes."""
@@ -52,6 +82,10 @@ def lancer_comite(contexte_actu: str) -> None:
 
 def lancer_comite_sur_these(thesis) -> None:
     """Fait passer une thèse (news OU screener) par le comité complet."""
+    # 🌍 Mémoire du monde : on journalise le thème du cycle (news OU screener).
+    #    Ici (et pas dans le Macro) pour que l'agent Macro — qui a déjà tourné
+    #    AVANT cet appel — ne voie QUE les thèmes des cycles PRÉCÉDENTS.
+    enregistrer_evenement(theme=thesis.theme, tickers=thesis.candidate_tickers)
     print("📊 [2/4] Agent Quant...")
     _, quant = validate_thesis(thesis)
     print(f"     Survivants : {quant.surviving_tickers}")
@@ -65,8 +99,15 @@ def lancer_comite_sur_these(thesis) -> None:
     print(f"     >>> ACTION : {decision.action.upper()} (confiance {decision.confidence})")
 
     print("\n📂 Mise à jour du portefeuille...")
-    for ligne in record_decision(thesis, decision):
+    journal_maj = record_decision(thesis, decision)
+    for ligne in journal_maj:
         print(ligne)
+
+    # 🔄 Si un arbitrage de capital a eu lieu, alerte Telegram dédiée
+    rotations = [l for l in journal_maj if "🔄" in l or "réalloué" in l]
+    if rotations:
+        asyncio.run(send_text("🔄 ARBITRAGE DE CAPITAL\n\n" + "\n".join(rotations)))
+
     portefeuille = snapshot_text(load_portfolio())
     print("\n" + portefeuille)
 
@@ -101,29 +142,35 @@ def revue_gerant(contexte_actu: str = "") -> None:
         print("   Mouvements du Gérant envoyés sur Telegram.")
 
 def run_once() -> None:
+    # 🛡️ Protection mécanique À CHAQUE cycle, en premier — avant toute autre chose.
+    executer_en_securite("Vérification des sorties (stops)", verifier_et_alerter_sorties)
     """Cycle complet. Le soir (17h), on révise d'abord les positions ; puis on cherche des idées."""
-    contexte = construire_contexte_actu()
+    contexte = executer_en_securite("Lecture des actualités", construire_contexte_actu) or ""
 
-    # 📋 Revue du portefeuille UNE fois par jour, sur le cycle du soir (17h Montréal = 21h UTC).
-    #    Les cycles du matin/midi ne cherchent que de nouvelles idées.
-    #    (Le stop-loss mécanique, lui, continue de protéger à chaque cycle via check_exits.)
+    # 📋 Revue du portefeuille UNE fois par jour, sur le cycle du soir (21h UTC).
+    #    Isolée : même si la lecture des actualités a échoué, le Gérant révise quand même.
     if datetime.now(timezone.utc).hour >= 20:
-        revue_gerant(contexte)
+        executer_en_securite("Revue du Gérant", revue_gerant, contexte)
 
     if not contexte:
         print("   Aucune actualité macro significative — pas de nouvelle idée aujourd'hui.")
         return
-    lancer_comite(contexte)
+    executer_en_securite("Comité (nouvelle idée)", lancer_comite, contexte)
 
 def run_screener() -> None:
+    # 🛡️ Protection mécanique À CHAQUE cycle screener aussi.
+    executer_en_securite("Vérification des sorties (stops)", verifier_et_alerter_sorties)
     """Cycle BOTTOM-UP : screener → thèse → comité → portefeuille → Telegram."""
     from src.screener.screener_thesis import generer_these_screener
 
     print("\n🔍 === CYCLE SCREENER (bottom-up) ===")
-    thesis = generer_these_screener(top_n=5)
+    thesis = executer_en_securite("Génération de la thèse screener", generer_these_screener, top_n=5)
+    if thesis is None:
+        print("   Screener : aucune thèse exploitable ce cycle.")
+        return
     print(f"     Thème : {thesis.theme[:70]}...")
     print(f"     Tickers : {thesis.candidate_tickers} | Confiance : {thesis.confidence}")
-    lancer_comite_sur_these(thesis)   # on réutilise le comité (voir étape 4)
+    executer_en_securite("Comité sur thèse screener", lancer_comite_sur_these, thesis)
 
 if __name__ == "__main__":
     run_once()

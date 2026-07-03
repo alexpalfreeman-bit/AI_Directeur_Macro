@@ -10,6 +10,8 @@ from src.schemas.thesis import MacroThesis
 from src.agents.tool_helper import appel_avec_retry
 
 from datetime import datetime
+from src.memory.world_memory import contexte_historique
+
 
 MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
            "août", "septembre", "octobre", "novembre", "décembre"]
@@ -60,17 +62,39 @@ source est fragile (rumeur, info isolée, voire erreur) — traite-le avec méfi
 abaisse fortement ta confiance, ou ne bâtis pas de thèse dessus. Ne construis jamais
 un pari important sur un événement non corroboré.
 
+MÉMOIRE DU MONDE : on te fournit les thèmes macro des 30 derniers jours. Sers-t'en pour
+faire des LIENS temporels : un thème qui revient plusieurs fois s'INTENSIFIE (signal plus
+fort) ; un thème qui se retourne (tension puis désescalade) doit t'alerter sur une possible
+incohérence avec une position déjà prise. Tu suis une histoire qui se déroule dans le temps,
+pas des flashs isolés — ne raisonne jamais comme si le passé récent n'existait pas.
+
+NATURE DU CATALYSEUR — champ obligatoire `catalyst.nature` : classe le catalyseur central
+et renseigne le champ structuré `nature` :
+- REAL : mécanisme causal concret et vérifiable, échéance identifiable. Seul type qui mérite
+  une confiance élevée.
+- HYPE : emballement narratif/médiatique sans mécanisme fondamental solide. Abaisse FORTEMENT
+  ta confiance ; ne bâtis JAMAIS un pari important sur du HYPE.
+- PRICED_IN : fait réel mais déjà connu et arbitré — le prix le reflète déjà, aucun edge à
+  capturer. C'est l'effet de PREMIER ordre que tu dois ignorer par principe. Si ton catalyseur
+  est PRICED_IN, cherche l'effet de 2e/3e ordre qu'il déclenche (lui non encore arbitré) ;
+  sinon, renonce à la thèse.
+Ta `confidence` DOIT rester cohérente avec ce classement : HYPE ou PRICED_IN ⇒ confiance basse.
+
 """
 
 
 def generate_thesis(news_context: str) -> MacroThesis:
     """Produit une MacroThesis validée à partir d'un contexte d'actualités."""
+    historique = contexte_historique(jours=30)
     user_content = (
         "Voici les actualités macro du moment. Identifie l'opportunité "
         "de 2e/3e ordre la plus prometteuse et soumets ta thèse via l'outil "
         "'soumettre_these'. Remplis TOUS les champs requis (dont 'rationale' et "
         "'confidence').\n\n"
-        f"--- ACTUALITÉS ---\n{news_context}"
+        "MÉMOIRE DU MONDE — thèmes macro rencontrés ces 30 derniers jours "
+        "(fais des LIENS : un thème qui s'intensifie ou qui se retourne) :\n"
+        f"{historique}\n\n"
+        f"--- ACTUALITÉS DU JOUR ---\n{news_context}"
     )
 
     # 🛡️ Sortie structurée + retry automatique si un champ manque (rationale, confidence…)
