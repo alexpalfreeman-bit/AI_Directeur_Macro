@@ -80,6 +80,20 @@ fournis pour le calibrer. Si ce niveau est franchi, on sort sans discuter.
 
 Sois concis et décisif. Tu n'écris pas un essai : tu donnes un ordre clair."""
 
+def _regime_tag(regime) -> str:
+    """Extrait une étiquette de régime propre (str) quel que soit le type renvoyé
+    par get_market_regime(), pour l'enregistrer dans la mémoire RAG."""
+    if isinstance(regime, str):
+        return regime
+    for attr in ("value", "regime", "label", "name"):
+        v = getattr(regime, attr, None)
+        if isinstance(v, str):
+            return v
+    if isinstance(regime, dict):
+        for cle in ("regime", "label", "name", "value"):
+            if isinstance(regime.get(cle), str):
+                return regime[cle]
+    return str(regime)
 
 def make_decision(thesis: MacroThesis, quant: QuantValidation,
                   risk: RiskAssessment) -> PortfolioDecision:
@@ -142,7 +156,7 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
     )
 
     # On mémorise la décision AVANT de la renvoyer
-    remember_decision(thesis, decision, regime_tag="a_qualifier")
+    remember_decision(thesis, decision, regime_tag=_regime_tag(regime))
     return decision
 
 if __name__ == "__main__":

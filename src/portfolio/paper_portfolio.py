@@ -45,6 +45,7 @@ class Position(BaseModel):
     invalidation_price: float | None = None
     conviction: float | None = None          # ← conviction du Directeur (0-1), sert à l'arbitrage
     sector: str = ""                         # ← secteur de la thèse, pour le plafond de diversification
+    horizon_days: int | None = None          # ← horizon de la thèse (jours), pour la sortie à l'échéance
     thesis_id: str = ""
     thesis_summary: str = ""
     opened_at: str = Field(default_factory=_now)
@@ -105,7 +106,8 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         stop_loss: float | None, profit_target: float | None,
         thesis_id: str = "", thesis_summary: str = "",
         invalidation_price: float | None = None,
-        conviction: float | None = None, sector: str = "") -> str:
+        conviction: float | None = None, sector: str = "",
+        horizon_days: int | None = None) -> str:
     if any(pos.ticker == ticker for pos in p.positions):
         return f"  ↪ {ticker} déjà en portefeuille — on n'ajoute pas."
     if not price or price <= 0:
@@ -138,7 +140,7 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         stop_loss=stop_loss, profit_target=profit_target,
         thesis_id=thesis_id, thesis_summary=thesis_summary,
         invalidation_price=invalidation_price,
-        conviction=conviction, sector=sector,
+        conviction=conviction, sector=sector, horizon_days=horizon_days,
     ))
     return f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ ({dollars:.0f}$ = {size_pct}%)"
 
@@ -173,7 +175,7 @@ def trim_position(p: Portfolio, pos: Position, exit_price: float,
         p.positions.remove(pos)
     return ligne
 
-# ─── Vérifier les sorties (stop-loss / objectif touchés) ───
+# ─── Vérifier les sorties (stop-loss / invalidation / objectif / échéance) ───
 def check_exits(p: Portfolio) -> list[str]:
     alerts = []
     for pos in list(p.positions):   # copie : on modifie la liste pendant l'itération
@@ -186,14 +188,20 @@ def check_exits(p: Portfolio) -> list[str]:
             alerts.append("❌ THÈSE INVALIDÉE ! " + close_position(p, pos, price, "these_invalidee"))
         elif pos.profit_target and price >= pos.profit_target:
             alerts.append("🎯 OBJECTIF atteint ! " + close_position(p, pos, price, "profit_target"))
+        elif (pos.horizon_days and _age_jours(pos) >= pos.horizon_days
+              and price <= pos.entry_price):
+            # ⏳ La fenêtre de la thèse est passée SANS qu'elle paie : on libère le capital.
+            #    Une position GAGNANTE (price > entrée), elle, continue de courir.
+            alerts.append("⏳ HORIZON ATTEINT (thèse non réalisée) ! "
+                          + close_position(p, pos, price, "horizon_expire"))
     return alerts
 
 def verifier_sorties() -> list[str]:
     """
     Protection mécanique indépendante : charge le portefeuille, vérifie stops /
-    invalidation / objectifs sur TOUTES les positions ouvertes, applique les sorties
-    déclenchées et sauvegarde. À appeler à CHAQUE cycle, sans attendre une décision.
-    Renvoie le journal des sorties (vide si rien ne s'est déclenché).
+    invalidation / objectifs / échéance sur TOUTES les positions ouvertes, applique
+    les sorties déclenchées et sauvegarde. À appeler à CHAQUE cycle, sans attendre
+    une décision. Renvoie le journal des sorties (vide si rien ne s'est déclenché).
     """
     p = load_portfolio()
     sorties = check_exits(p)
@@ -451,7 +459,8 @@ def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[st
                                pos.stop_loss, pos.profit_target, thesis.thesis_id, resume,
                                invalidation_price=pos.invalidation_price,
                                conviction=pos.conviction,
-                               sector=thesis.sector))
+                               sector=thesis.sector,
+                               horizon_days=thesis.time_horizon_days))
     else:
         log.append(f"  ↪ Décision {decision.action.value.upper()} : aucune position ouverte.")
 
