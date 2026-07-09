@@ -11,11 +11,15 @@ from src.agents.macro_agent import generate_thesis
 from src.agents.quant_agent import validate_thesis
 from src.agents.devils_advocate_agent import challenge_thesis
 from src.agents.portfolio_manager_agent import make_decision
-from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text, verifier_sorties
+from src.portfolio.paper_portfolio import (
+    record_decision, load_portfolio, snapshot_text, verifier_sorties,
+    verrou_portefeuille, VerrouIndisponible,
+)
 from src.communication.telegram_bot import send_decision_et_portefeuille, send_text
 from src.ingestion.news_client import fetch_headlines, is_macro_relevant, corroborer_actualites
 from datetime import datetime, timezone
 from src.memory.world_memory import enregistrer_evenement
+from src.analytics.performance import snapshot_quotidien
 import traceback
 
 def executer_en_securite(nom_etape: str, fonction, *args, **kwargs):
@@ -142,8 +146,19 @@ def revue_gerant(contexte_actu: str = "") -> None:
         print("   Mouvements du Gérant envoyés sur Telegram.")
 
 def run_once() -> None:
+    # 🔒 C3 — tout le cycle sous verrou distribué : deux crons concurrents ne s'écrasent plus.
+    try:
+        with verrou_portefeuille():
+            _run_once_corps()
+    except VerrouIndisponible as e:
+        print(f"⏭️  Cycle run_news sauté — {e}")
+
+
+def _run_once_corps() -> None:
     # 🛡️ Protection mécanique À CHAQUE cycle, en premier — avant toute autre chose.
     executer_en_securite("Vérification des sorties (stops)", verifier_et_alerter_sorties)
+    # 📸 Photo quotidienne de l'équity (idempotent par date : le dernier cron du jour gagne).
+    executer_en_securite("Snapshot performance", lambda: print(snapshot_quotidien()))
     """Cycle complet. Le soir (17h), on révise d'abord les positions ; puis on cherche des idées."""
     contexte = executer_en_securite("Lecture des actualités", construire_contexte_actu) or ""
 
@@ -158,8 +173,19 @@ def run_once() -> None:
     executer_en_securite("Comité (nouvelle idée)", lancer_comite, contexte)
 
 def run_screener() -> None:
+    # 🔒 C3 — même verrou distribué pour le cycle screener.
+    try:
+        with verrou_portefeuille():
+            _run_screener_corps()
+    except VerrouIndisponible as e:
+        print(f"⏭️  Cycle screener sauté — {e}")
+
+
+def _run_screener_corps() -> None:
     # 🛡️ Protection mécanique À CHAQUE cycle screener aussi.
     executer_en_securite("Vérification des sorties (stops)", verifier_et_alerter_sorties)
+    # 📸 Même photo quotidienne ici (idempotent : capte le jour même sans news).
+    executer_en_securite("Snapshot performance", lambda: print(snapshot_quotidien()))
     """Cycle BOTTOM-UP : screener → thèse → comité → portefeuille → Telegram."""
     from src.screener.screener_thesis import generer_these_screener
 

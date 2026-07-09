@@ -7,6 +7,9 @@ les exécutions : c'est la mémoire de tes positions.
 """
 from __future__ import annotations
 import os                                    
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -14,7 +17,7 @@ from upstash_redis import Redis
 
 from config.settings import settings
 from src.ingestion.market_client import get_fundamentals
-from src.schemas.thesis import MacroThesis
+from src.schemas.thesis import MacroThesis, Direction
 from src.schemas.decision import PortfolioDecision
 
 PORTFOLIO_FILE = Path("data/portfolio.json")
@@ -31,6 +34,84 @@ if _redis is not None:
 else:
     print("⚠️ Redis NON configuré (variables absentes) — repli sur fichier local.")
 PORTFOLIO_KEY = "portfolio"
+PORTFOLIO_INIT_KEY = "portfolio_initialized"   # C4 — témoin : un portefeuille a déjà existé
+VERROU_KEY = "verrou:portfolio"                # C3 — clé du verrou distribué
+
+# 🎯 C1 — tolérance de dérive entre le prix supposé par le plan (celui du LLM) et le
+# prix RÉEL au moment du fill. Au-delà, les niveaux (stop/objectif/invalidation) ne sont
+# plus calibrés sur le marché : on refuse d'entrer plutôt que d'ouvrir une position bancale.
+TOLERANCE_ENTREE_PCT = 1.5
+
+# 🔒 C3 — paramètres du verrou. TTL large (LLM lents) ; un cron concurrent attend au plus
+# ATTENTE_MAX puis SAUTE son cycle (on préfère sauter que de risquer une écriture concurrente).
+VERROU_TTL_S = 600
+VERROU_ATTENTE_MAX_S = 60
+VERROU_INTERVALLE_S = 3.0
+
+
+class LectureStockageErreur(RuntimeError):
+    """C4 — Une LECTURE de stockage a échoué (ou incohérence détectée). L'appelant NE DOIT
+    PAS écrire : écrire par-dessus détruirait l'historique. On lève, on n'écrase jamais."""
+
+
+class VerrouIndisponible(RuntimeError):
+    """C3 — Le verrou portefeuille n'a pas pu être acquis à temps : un autre cycle tourne.
+    On saute proprement plutôt que de risquer une écriture concurrente (lost update)."""
+
+
+# Script Lua de libération sûre : ne supprime le verrou QUE s'il nous appartient encore.
+_LUA_LIBERER = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+
+@contextmanager
+def verrou_portefeuille(ttl: int = VERROU_TTL_S,
+                        attente_max: int = VERROU_ATTENTE_MAX_S,
+                        intervalle: float = VERROU_INTERVALLE_S):
+    """
+    C3 — Verrou distribué autour d'un cycle qui lit-modifie-écrit le portefeuille.
+    En LOCAL (pas de Redis), un seul processus tourne : le verrou est inutile → no-op.
+    En CLOUD, SET NX EX pose le verrou ; s'il est déjà pris, on réessaie jusqu'à
+    `attente_max`, sinon on lève VerrouIndisponible. Libération sûre par comparaison de jeton.
+    """
+    if _redis is None:
+        yield
+        return
+
+    jeton = uuid.uuid4().hex
+    debut = time.monotonic()
+    acquis = False
+    while True:
+        try:
+            ok = _redis.set(VERROU_KEY, jeton, nx=True, ex=ttl)
+        except Exception as e:
+            raise LectureStockageErreur(f"Verrou Redis inaccessible : {e}") from e
+        if ok:
+            acquis = True
+            break
+        if time.monotonic() - debut >= attente_max:
+            break
+        time.sleep(intervalle)
+
+    if not acquis:
+        raise VerrouIndisponible(
+            f"Verrou « {VERROU_KEY} » déjà détenu depuis > {attente_max}s — "
+            f"cycle sauté pour éviter une écriture concurrente.")
+
+    try:
+        yield
+    finally:
+        # Libération best-effort : à défaut, le TTL nettoiera de toute façon.
+        try:
+            _redis.eval(_LUA_LIBERER, [VERROU_KEY], [jeton])
+        except Exception:
+            try:
+                if _redis.get(VERROU_KEY) == jeton:
+                    _redis.delete(VERROU_KEY)
+            except Exception:
+                pass
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -80,13 +161,43 @@ def _nouveau_portefeuille() -> Portfolio:
 def load_portfolio() -> Portfolio:
     # Cloud : lecture depuis Redis (persiste entre les exécutions)
     if _redis is not None:
-        data = _redis.get(PORTFOLIO_KEY)
+        # C4 — une lecture qui ÉCHOUE ne doit jamais mener à recréer/écraser.
+        try:
+            data = _redis.get(PORTFOLIO_KEY)
+        except Exception as e:
+            raise LectureStockageErreur(
+                f"Lecture Redis du portefeuille échouée ({e}) — écriture bloquée "
+                f"pour ne pas écraser l'historique.") from e
+
         if data:
+            # Auto-cicatrisation : marque tout portefeuille préexistant comme initialisé,
+            # pour que la garde ci-dessous protège aussi les portefeuilles créés avant C4.
+            try:
+                _redis.set(PORTFOLIO_INIT_KEY, "1")
+            except Exception:
+                pass
             return Portfolio.model_validate_json(data)
+
+        # Clé « portfolio » vide : VRAI premier démarrage, ou clé disparue/tronquée ?
+        try:
+            deja_initialise = _redis.get(PORTFOLIO_INIT_KEY)
+        except Exception as e:
+            raise LectureStockageErreur(
+                f"Lecture du témoin d'initialisation échouée ({e}) — écriture bloquée.") from e
+
+        if deja_initialise:
+            # Un portefeuille a DÉJÀ existé mais la clé est vide : anomalie de stockage.
+            raise LectureStockageErreur(
+                "Clé « portfolio » vide alors que le témoin d'initialisation existe : "
+                "anomalie de stockage. Refus de recréer un portefeuille neuf "
+                "(protection anti-écrasement). Vérifie Upstash avant de relancer.")
+
+        # Authentique premier démarrage : aucun portefeuille, aucun témoin.
         p = _nouveau_portefeuille()
         save_portfolio(p)
         return p
-    # Local : lecture depuis le fichier JSON
+
+    # Local : lecture depuis le fichier JSON (mono-processus, comportement inchangé)
     if PORTFOLIO_FILE.exists():
         return Portfolio.model_validate_json(PORTFOLIO_FILE.read_text(encoding="utf-8"))
     p = _nouveau_portefeuille()
@@ -97,11 +208,44 @@ def load_portfolio() -> Portfolio:
 def save_portfolio(p: Portfolio) -> None:
     if _redis is not None:
         _redis.set(PORTFOLIO_KEY, p.model_dump_json())
+        _redis.set(PORTFOLIO_INIT_KEY, "1")   # C4 — mémorise qu'un portefeuille a existé
         return
     PORTFOLIO_FILE.parent.mkdir(parents=True, exist_ok=True)
     PORTFOLIO_FILE.write_text(p.model_dump_json(indent=2), encoding="utf-8")
 
 # ─── Acheter (paper) ───
+# ─── S2/S4 — Bases de décision : équity courante & exposition en valeur de marché ───
+def _prix_courant(ticker: str, repli: float) -> float:
+    """Prix marché courant (via le cache market_client), repli sur le coût d'entrée si indispo."""
+    prix = get_fundamentals(ticker).get("price")
+    return prix if (prix and prix > 0) else repli
+
+
+def _valeur_marche(pos: "Position") -> float:
+    """Valeur de marché d'une position = actions × prix courant (repli : coût d'entrée)."""
+    return pos.shares * _prix_courant(pos.ticker, pos.entry_price)
+
+
+def equity_courante(p: "Portfolio") -> float:
+    """S2 — Équity courante = cash + valeur de marché des positions ouvertes. C'est la BASE
+    de dimensionnement : le risque % reste stable au lieu de gonfler quand l'équity baisse."""
+    return p.cash + sum(_valeur_marche(pos) for pos in p.positions)
+
+
+def _expo_secteur(p: "Portfolio", secteur: str) -> float:
+    """S4 — Exposition d'un secteur en VALEUR DE MARCHÉ (plus en coût d'entrée)."""
+    return sum(_valeur_marche(pos) for pos in p.positions if pos.sector == secteur)
+
+
+def _secteur_reel(ticker: str, repli_texte: str) -> str:
+    """S4 — Secteur STANDARDISÉ via yfinance (Energy, Technology…) au lieu du texte libre du
+    LLM. Repli : le texte de la thèse normalisé (title-case) si yfinance ne renvoie rien."""
+    s = get_fundamentals(ticker).get("sector")
+    if s:
+        return s
+    return (repli_texte or "").strip().title() or "Inconnu"
+
+
 def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         stop_loss: float | None, profit_target: float | None,
         thesis_id: str = "", thesis_summary: str = "",
@@ -112,18 +256,18 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         return f"  ↪ {ticker} déjà en portefeuille — on n'ajoute pas."
     if not price or price <= 0:
         return f"  ↪ Prix indisponible pour {ticker} — achat annulé."
-    dollars = (size_pct / 100.0) * p.starting_capital
+    base = equity_courante(p)                       # S2 — dimensionnement sur l'ÉQUITY courante
+    dollars = (size_pct / 100.0) * base
 
     # 🛡️ Plafond par TITRE : aucun titre ne dépasse le plafond, quoi que dise le Directeur
-    plafond_dollars = (settings.max_position_pct / 100.0) * p.starting_capital
+    plafond_dollars = (settings.max_position_pct / 100.0) * base
     if dollars > plafond_dollars:
         dollars = plafond_dollars
 
     # 🛡️ Plafond par SECTEUR : on ne surconcentre pas un même thème macro
     if sector:
-        plafond_secteur = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * p.starting_capital
-        expo_secteur = sum(pos.shares * pos.entry_price
-                           for pos in p.positions if pos.sector == sector)
+        plafond_secteur = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * base
+        expo_secteur = _expo_secteur(p, sector)     # S4 — exposition en VALEUR DE MARCHÉ
         headroom = plafond_secteur - expo_secteur
         if headroom <= 0:
             return (f"  ↪ Plafond secteur « {sector} » atteint "
@@ -311,7 +455,7 @@ def tenter_arbitrage(p: Portfolio, plan) -> tuple[bool, list[str]]:
         return False, log   # sans conviction sur la nouvelle idée, pas d'arbitrage
 
     # Coût (écrêté au plafond 15 %) de la position visée
-    cout_cible = (min(plan.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
+    cout_cible = (min(plan.position_size_pct, settings.max_position_pct) / 100.0) * equity_courante(p)
 
     # Candidats au sacrifice : conviction CONNUE, assez anciens, ticker différent de la cible
     candidats = [
@@ -363,8 +507,8 @@ def tenter_arbitrage(p: Portfolio, plan) -> tuple[bool, list[str]]:
 # ─── Arbitrage sectoriel ───
 def _headroom_secteur(p: Portfolio, secteur: str) -> float:
     """Place restante (en $) dans un secteur avant d'atteindre le plafond."""
-    plafond = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * p.starting_capital
-    expo = sum(pos.shares * pos.entry_price for pos in p.positions if pos.sector == secteur)
+    plafond = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * equity_courante(p)   # S2
+    expo = _expo_secteur(p, secteur)                                                      # S4
     return plafond - expo
 
 
@@ -382,8 +526,8 @@ def tenter_arbitrage_sectoriel(p: Portfolio, plan, secteur: str) -> tuple[bool, 
     if conv_cible is None:
         return False, log
 
-    cout_cible = (min(plan.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
-    plafond_secteur = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * p.starting_capital
+    cout_cible = (min(plan.position_size_pct, settings.max_position_pct) / 100.0) * equity_courante(p)
+    plafond_secteur = (getattr(settings, "max_sector_pct", 40.0) / 100.0) * equity_courante(p)
 
     # Candidats : MÊME secteur, conviction connue, assez anciens, ticker différent
     candidats = [
@@ -412,8 +556,8 @@ def tenter_arbitrage_sectoriel(p: Portfolio, plan, secteur: str) -> tuple[bool, 
         return False, log
 
     # La vente doit débloquer À LA FOIS assez de place SECTEUR et assez de CASH pour la cible
-    cout_faible = faible.shares * faible.entry_price          # base de coût = place secteur libérée
-    expo_secteur = sum(pos.shares * pos.entry_price for pos in p.positions if pos.sector == secteur)
+    cout_faible = faible.shares * prix_faible                 # S4 — valeur de marché = place réellement libérée
+    expo_secteur = _expo_secteur(p, secteur)                  # S4 — exposition en valeur de marché
     headroom_apres = plafond_secteur - (expo_secteur - cout_faible)
     cash_apres = p.cash + faible.shares * prix_faible
     if headroom_apres < cout_cible or cash_apres < cout_cible:
@@ -428,39 +572,101 @@ def tenter_arbitrage_sectoriel(p: Portfolio, plan, secteur: str) -> tuple[bool, 
 
 
 # ─── Enregistrer une décision du Directeur ───
+def _plan_incoherent(entry: float | None, stop: float | None,
+                     target: float | None, invalidation: float | None) -> str | None:
+    """
+    C2 — Valide la COHÉRENCE des niveaux d'un plan LONG. Renvoie une raison (str) si le
+    plan est incohérent, sinon None. Ne contrôle que les niveaux FOURNIS (None = absent =
+    non vérifié). Pour un LONG : stop SOUS l'entrée, objectif AU-DESSUS, invalidation SOUS.
+    """
+    if not entry or entry <= 0:
+        return "prix d'entrée absent ou nul"
+    if stop is not None and stop >= entry:
+        return f"stop {stop}$ ≥ entrée {entry}$ (un stop LONG doit être SOUS l'entrée)"
+    if target is not None and target <= entry:
+        return f"objectif {target}$ ≤ entrée {entry}$ (un objectif LONG doit être AU-DESSUS de l'entrée)"
+    if invalidation is not None and invalidation >= entry:
+        return f"invalidation {invalidation}$ ≥ entrée {entry}$ (doit être SOUS l'entrée pour un LONG)"
+    return None
+
+
+def _prix_reel(ticker: str) -> float | None:
+    """C1 — Prix RÉEL du marché au moment du fill (jamais celui imaginé par le LLM)."""
+    fond = get_fundamentals(ticker) or {}
+    prix = fond.get("price")
+    return prix if (prix and prix > 0) else None
+
+
 def record_decision(thesis: MacroThesis, decision: PortfolioDecision) -> list[str]:
     """Vérifie les sorties, puis achète si la décision est EXECUTE. Renvoie un journal."""
     p = load_portfolio()
     log = check_exits(p)            # 1) on gère d'abord les sorties existantes
 
+    # 🛡️ C2 — Le portefeuille est LONG-ONLY. Une thèse SHORT ne doit JAMAIS être exécutée
+    #    comme un achat LONG (ce qui inverserait complètement le pari). On refuse en bloc.
+    if thesis.direction == Direction.SHORT:
+        log.append(f"  ⛔ Thèse SHORT « {thesis.theme[:60]} » refusée : portefeuille long-only — "
+                   f"on n'exécute pas un short comme un achat (ce serait le pari inverse).")
+        save_portfolio(p)
+        return log
+
     if decision.action.value == "execute":   # 2) puis les nouveaux achats
         rotation_utilisee = False   # 🔄 au plus UNE rotation par cycle (sectorielle OU capital)
         for pos in decision.positions:
-            if pos.position_size_pct and pos.position_size_pct > 0 and pos.entry_price:
-                cout = (min(pos.position_size_pct, settings.max_position_pct) / 100.0) * p.starting_capital
+            if not (pos.position_size_pct and pos.position_size_pct > 0 and pos.entry_price):
+                continue
 
-                # 🔄 1) Le SECTEUR bloque-t-il ? -> rotation INTRA-secteur (vend la faible du secteur)
-                if (not rotation_utilisee and thesis.sector
-                        and _headroom_secteur(p, thesis.sector) < cout):
-                    faite, journal_arb = tenter_arbitrage_sectoriel(p, pos, thesis.sector)
-                    log.extend(journal_arb)
-                    if faite:
-                        rotation_utilisee = True
+            # 🛡️ C2 — Cohérence des niveaux du plan (référence = entry_price du plan LLM).
+            raison = _plan_incoherent(pos.entry_price, pos.stop_loss,
+                                      pos.profit_target, pos.invalidation_price)
+            if raison:
+                log.append(f"  ⛔ {pos.ticker} écarté — plan incohérent : {raison}.")
+                continue
 
-                # 🔄 2) Sinon le CASH bloque-t-il ? -> rotation portefeuille (vend la plus faible globale)
-                if not rotation_utilisee and cout > p.cash:
-                    faite, journal_arb = tenter_arbitrage(p, pos)
-                    log.extend(journal_arb)
-                    if faite:
-                        rotation_utilisee = True
+            # 🛡️ C1 — On lit le PRIX RÉEL du marché ; on ne remplit jamais au prix du LLM.
+            prix_reel = _prix_reel(pos.ticker)
+            if prix_reel is None:
+                log.append(f"  ⛔ {pos.ticker} écarté — prix marché indisponible au moment du fill.")
+                continue
 
-                resume = f"{thesis.theme} | {pos.rationale[:200]}"
-                log.append(buy(p, pos.ticker, pos.entry_price, pos.position_size_pct,
-                               pos.stop_loss, pos.profit_target, thesis.thesis_id, resume,
-                               invalidation_price=pos.invalidation_price,
-                               conviction=pos.conviction,
-                               sector=thesis.sector,
-                               horizon_days=thesis.time_horizon_days))
+            # 🛡️ C1 — Si le marché a dérivé du plan au-delà de la tolérance, la thèse
+            #    (stop/objectif/invalidation) n'est plus calibrée : on refuse d'entrer.
+            derive_pct = abs(prix_reel / pos.entry_price - 1) * 100
+            if derive_pct > TOLERANCE_ENTREE_PCT:
+                log.append(f"  ⛔ {pos.ticker} écarté — le marché a bougé de {derive_pct:.1f}% "
+                           f"vs le plan ({pos.entry_price}$ → {prix_reel}$, tolérance "
+                           f"{TOLERANCE_ENTREE_PCT}%). Thèse à recalibrer.")
+                continue
+
+            # S4 — secteur STANDARDISÉ (yfinance) au lieu du texte libre du LLM ; sert aux
+            # plafonds ET est stocké sur la position pour une exposition cohérente.
+            secteur_reel = _secteur_reel(pos.ticker, thesis.sector)
+
+            cout = (min(pos.position_size_pct, settings.max_position_pct) / 100.0) * equity_courante(p)
+
+            # 🔄 1) Le SECTEUR bloque-t-il ? -> rotation INTRA-secteur (vend la faible du secteur)
+            if (not rotation_utilisee and secteur_reel
+                    and _headroom_secteur(p, secteur_reel) < cout):
+                faite, journal_arb = tenter_arbitrage_sectoriel(p, pos, secteur_reel)
+                log.extend(journal_arb)
+                if faite:
+                    rotation_utilisee = True
+
+            # 🔄 2) Sinon le CASH bloque-t-il ? -> rotation portefeuille (vend la plus faible globale)
+            if not rotation_utilisee and cout > p.cash:
+                faite, journal_arb = tenter_arbitrage(p, pos)
+                log.extend(journal_arb)
+                if faite:
+                    rotation_utilisee = True
+
+            resume = f"{thesis.theme} | {pos.rationale[:200]}"
+            # 🔑 C1 — on passe PRIX_REEL à buy(), plus jamais pos.entry_price.
+            log.append(buy(p, pos.ticker, prix_reel, pos.position_size_pct,
+                           pos.stop_loss, pos.profit_target, thesis.thesis_id, resume,
+                           invalidation_price=pos.invalidation_price,
+                           conviction=pos.conviction,
+                           sector=secteur_reel,
+                           horizon_days=thesis.time_horizon_days))
     else:
         log.append(f"  ↪ Décision {decision.action.value.upper()} : aucune position ouverte.")
 

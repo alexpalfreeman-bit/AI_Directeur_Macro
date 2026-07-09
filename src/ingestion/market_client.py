@@ -9,13 +9,35 @@ import requests
 from src.ingestion.ticker_resolver import resolve_ticker
 
 
-def get_fundamentals(ticker: str) -> dict:
-    """Récupère les fondamentaux RÉELS d'une action via Yahoo Finance."""
-    ticker = resolve_ticker(ticker)          # LSB devient LXU, etc.
+# 🗄️ S3 — Cache par PROCESSUS. Dans un même cycle (un run de cron), on ne réinterroge
+# pas yfinance pour un ticker déjà récupéré avec succès. Cela réduit fortement le nombre
+# d'appels `t.info` (SPY et chaque position sont sinon lus plusieurs fois par cycle) →
+# moins de throttling Yahoo → moins de `price=None` qui désactivent silencieusement les stops.
+# Le cache vit le temps du processus : chaque cron repart d'un cache vide (aucune péremption
+# à gérer, et donc aucun risque de prix périmé d'un cycle à l'autre).
+_CACHE_FONDAMENTAUX: dict[str, dict] = {}
+
+
+def vider_cache_fondamentaux() -> None:
+    """Vide le cache de fondamentaux (utile en test, ou pour forcer un rafraîchissement)."""
+    _CACHE_FONDAMENTAUX.clear()
+
+
+def get_fundamentals(ticker: str, utiliser_cache: bool = True) -> dict:
+    """
+    Récupère les fondamentaux RÉELS d'une action via Yahoo Finance.
+
+    S3 — Un SUCCÈS est mémorisé pour le reste du processus. Un ÉCHEC n'est PAS mis en
+    cache : le throttling est transitoire, on veut pouvoir réessayer plus tard dans le cycle.
+    """
+    cle = resolve_ticker(ticker)          # LSB devient LXU, etc.
+
+    if utiliser_cache and cle in _CACHE_FONDAMENTAUX:
+        return _CACHE_FONDAMENTAUX[cle]
 
     session = requests.Session()
     session.headers["User-agent"] = "Mozilla/5.0"
-    t = yf.Ticker(ticker, session=session)
+    t = yf.Ticker(cle, session=session)
 
     # 🛡️ Filet de sécurité : un ticker invalide/exotique ne doit JAMAIS tout faire planter
     try:
@@ -27,12 +49,14 @@ def get_fundamentals(ticker: str) -> dict:
             info = t.info
         hist = t.history(period="1mo")
     except Exception as e:
-        print(f"  ⚠️  Données indisponibles pour {ticker} ({e}) — ticker ignoré.")
+        print(f"  ⚠️  Données indisponibles pour {cle} ({e}) — ticker ignoré.")
+        # ⚠️ Échec NON mis en cache : on pourra réessayer ce ticker plus tard dans le cycle.
         return {
-            "ticker": ticker.upper(), "name": None, "price": None,
+            "ticker": cle.upper(), "name": None, "price": None,
             "pe_ratio": None, "debt_to_equity": None, "revenue_growth_yoy": None,
             "market_cap": None, "sector": None, "volatility_30d_pct": None,
-            "ev_to_ebitda": None, "price_to_book": None, "avg_volume": None, "data_source": "indisponible",
+            "ev_to_ebitda": None, "price_to_book": None, "avg_volume": None,
+            "data_source": "indisponible",
         }
 
     if not hist.empty:
@@ -49,8 +73,8 @@ def get_fundamentals(ticker: str) -> dict:
     if price is None and not hist.empty:
         price = round(float(hist["Close"].iloc[-1]), 2)
 
-    return {
-        "ticker": ticker.upper(),
+    resultat = {
+        "ticker": cle.upper(),
         "name": info.get("shortName"),
         "price": price,
         "pe_ratio": info.get("trailingPE"),
@@ -61,8 +85,15 @@ def get_fundamentals(ticker: str) -> dict:
         "volatility_30d_pct": volatility_30d,
         "ev_to_ebitda": info.get("enterpriseToEbitda"),   # meilleur que le PE sur cycliques
         "price_to_book": info.get("priceToBook"),         # lecture de cycle plus honnête
+        # 🎯 S1 — le volume moyen est ENFIN renseigné : le filtre de liquidité devient VIVANT.
+        # (plusieurs clés yfinance possibles selon le titre ; on prend la première disponible)
+        "avg_volume": (info.get("averageVolume")
+                       or info.get("averageDailyVolume3Month")
+                       or info.get("averageVolume10days")),
         "data_source": "yfinance",                        # traçabilité : d'où vient le chiffre
     }
+    _CACHE_FONDAMENTAUX[cle] = resultat      # S3 — succès mémorisé pour le reste du processus
+    return resultat
 
 
 if __name__ == "__main__":
