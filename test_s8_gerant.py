@@ -68,11 +68,15 @@ check("RUN_GERANT=1 → True", avec_env("1", lambda: pl._doit_lancer_gerant()) i
 check("RUN_GERANT=0 → False", avec_env("0", lambda: pl._doit_lancer_gerant()) is False)
 check("RUN_GERANT=' 1 ' (espaces tolérés) → True", avec_env(" 1 ", lambda: pl._doit_lancer_gerant()) is True)
 
-print("\n=== S8 — repli sur l'heure locale quand RUN_GERANT n'est pas défini ===")
-t_soir = datetime(2025, 7, 1, 18, 0, tzinfo=timezone.utc)   # .hour = 18 → soir
-t_matin = datetime(2025, 7, 1, 9, 0, tzinfo=timezone.utc)   # .hour = 9  → matin
-check("18h → True (>=17)", avec_env(None, lambda: pl._doit_lancer_gerant(t_soir)) is True)
-check("9h → False (<17)", avec_env(None, lambda: pl._doit_lancer_gerant(t_matin)) is False)
+print("\n=== S8 — repli sur l'heure locale quand RUN_GERANT n'est pas défini (seuil 16h) ===")
+t_soir_ete = datetime(2025, 7, 1, 17, 0, tzinfo=timezone.utc)    # .hour = 17 → été, soir
+t_soir_hiver = datetime(2025, 1, 1, 16, 0, tzinfo=timezone.utc)  # .hour = 16 → hiver, soir (21h UTC)
+t_apresmidi = datetime(2025, 7, 1, 15, 0, tzinfo=timezone.utc)   # .hour = 15 → trop tôt
+t_matin = datetime(2025, 7, 1, 11, 0, tzinfo=timezone.utc)       # .hour = 11 → passage midi
+check("17h → True (soir été)", avec_env(None, lambda: pl._doit_lancer_gerant(t_soir_ete)) is True)
+check("16h → True (soir hiver, 21h UTC en EST)", avec_env(None, lambda: pl._doit_lancer_gerant(t_soir_hiver)) is True)
+check("15h → False (juste sous le seuil)", avec_env(None, lambda: pl._doit_lancer_gerant(t_apresmidi)) is False)
+check("11h → False (passage de midi, jamais de Gérant)", avec_env(None, lambda: pl._doit_lancer_gerant(t_matin)) is False)
 
 print("\n" + ("🎉 TOUS LES TESTS PASSENT" if not echecs else f"⚠️ ÉCHECS : {echecs}"))
 sys.exit(1 if echecs else 0)

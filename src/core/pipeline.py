@@ -165,7 +165,10 @@ def _doit_lancer_gerant(maintenant: datetime | None = None) -> bool:
             maintenant = datetime.now(ZoneInfo("America/Montreal"))
         except Exception:
             maintenant = datetime.now(timezone.utc)   # ultime repli si tzdata absent
-    return maintenant.hour >= 17
+    # Seuil à 16h (pas 17h) : le cron du soir tourne à 21h UTC, soit 17h à Montréal l'été
+    # MAIS 16h l'hiver (EST). 16h couvre les deux saisons sans jamais attraper les
+    # passages de 11h/16h UTC (= 6-7h / 11-12h Montréal, très en dessous).
+    return maintenant.hour >= 16
 
 
 def run_once() -> None:
