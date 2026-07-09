@@ -24,12 +24,19 @@ def appel_avec_retry(client, model, system, user_content, tool_name,
     forcer_id = forcer_id or {}
 
     derniere_erreur = None
+    tokens = max_tokens
     for essai in range(1, max_essais + 1):
         response = client.messages.create(
-            model=model, max_tokens=max_tokens, system=system,
+            model=model, max_tokens=tokens, system=system,
             tools=[tool], tool_choice={"type": "tool", "name": tool_name},
             messages=messages,
         )
+        # 🛡️ S6 — réponse TRONQUÉE (budget de tokens atteint) : un tool_use coupé au milieu
+        #    est invalide et ferait échouer tous les essais au même plafond. On double le
+        #    budget pour le prochain essai (plafonné), au lieu de ré-échouer identiquement.
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            tokens = min(tokens * 2, 8192)
+            print(f"  ⚠️  Réponse tronquée (max_tokens) — budget porté à {tokens} au prochain essai.")
         block = next((b for b in response.content if b.type == "tool_use"), None)
         if block is None:
             derniere_erreur = "Aucun appel d'outil dans la réponse."

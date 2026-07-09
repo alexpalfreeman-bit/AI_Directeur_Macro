@@ -17,7 +17,9 @@ from src.portfolio.paper_portfolio import (
 )
 from src.communication.telegram_bot import send_decision_et_portefeuille, send_text
 from src.ingestion.news_client import fetch_headlines, is_macro_relevant, corroborer_actualites
+import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from src.memory.world_memory import enregistrer_evenement
 from src.analytics.performance import snapshot_quotidien
 import traceback
@@ -145,6 +147,27 @@ def revue_gerant(contexte_actu: str = "") -> None:
         asyncio.run(send_text(texte))
         print("   Mouvements du Gérant envoyés sur Telegram.")
 
+def _doit_lancer_gerant(maintenant: datetime | None = None) -> bool:
+    """
+    S8 — Décide si le Gérant révise les positions sur ce cycle.
+
+    1) Contrôle EXPLICITE recommandé : pose RUN_GERANT=1 sur le cron du soir (et rien
+       sur les autres). Le planificateur Render décide de l'heure, pas le code — donc
+       aucun décalage possible au changement d'heure.
+    2) Repli (si RUN_GERANT n'est pas défini) : heure LOCALE de Montréal via zoneinfo
+       (DST-correct), au lieu de l'heure UTC brute qui dérivait de ±1 h selon la saison.
+    """
+    flag = os.getenv("RUN_GERANT")
+    if flag is not None:
+        return flag.strip() == "1"
+    if maintenant is None:
+        try:
+            maintenant = datetime.now(ZoneInfo("America/Montreal"))
+        except Exception:
+            maintenant = datetime.now(timezone.utc)   # ultime repli si tzdata absent
+    return maintenant.hour >= 17
+
+
 def run_once() -> None:
     # 🔒 C3 — tout le cycle sous verrou distribué : deux crons concurrents ne s'écrasent plus.
     try:
@@ -162,9 +185,10 @@ def _run_once_corps() -> None:
     """Cycle complet. Le soir (17h), on révise d'abord les positions ; puis on cherche des idées."""
     contexte = executer_en_securite("Lecture des actualités", construire_contexte_actu) or ""
 
-    # 📋 Revue du portefeuille UNE fois par jour, sur le cycle du soir (21h UTC).
+    # 📋 Revue du portefeuille UNE fois par jour (voir _doit_lancer_gerant : RUN_GERANT=1
+    #    sur le cron du soir, sinon repli sur l'heure locale Montréal, DST-correct).
     #    Isolée : même si la lecture des actualités a échoué, le Gérant révise quand même.
-    if datetime.now(timezone.utc).hour >= 20:
+    if _doit_lancer_gerant():
         executer_en_securite("Revue du Gérant", revue_gerant, contexte)
 
     if not contexte:

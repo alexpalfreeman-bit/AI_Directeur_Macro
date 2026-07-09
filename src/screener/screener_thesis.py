@@ -4,11 +4,13 @@ Pont entre le screener (bottom-up) et le comité.
 Transforme les meilleurs scores en une thèse que le Quant, l'Avocat du Diable
 et le Directeur savent déjà évaluer. Le screener PROPOSE, le comité DISPOSE.
 """
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 import anthropic
 from config.settings import settings
 from src.schemas.thesis import MacroThesis
 from src.screener.screener import scanner_univers
+from src.agents.tool_helper import appel_avec_retry   # S6 — même robustesse que les autres agents
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -37,32 +39,33 @@ def generer_these_screener(top_n: int = 5) -> MacroThesis:
     )
     tickers = [r["ticker"] for r in top]
 
-    tool = {
-        "name": "soumettre_these",
-        "description": "Soumet une thèse d'investissement bottom-up structurée.",
-        "input_schema": MacroThesis.model_json_schema(),
-    }
-    response = client.messages.create(
-        model=settings.llm_model,
-        max_tokens=1500,
-        system=SYSTEM_PROMPT,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "soumettre_these"},
-        messages=[{"role": "user", "content": (
-            f"Voici le TOP {top_n} d'un screener par facteurs (données réelles) :\n\n"
-            f"{classement}\n\n"
-            "Formule une thèse bottom-up via l'outil. Le type de catalyseur est 'other'. "
-            "Utilise EXACTEMENT ces tickers comme candidats. Sois honnête sur les "
-            "valorisations si elles sont tendues."
-        )}],
+    user_content = (
+        f"Voici le TOP {top_n} d'un screener par facteurs (données réelles) :\n\n"
+        f"{classement}\n\n"
+        "Formule une thèse bottom-up via l'outil. Le type de catalyseur est 'other'. "
+        "Utilise EXACTEMENT ces tickers comme candidats. Sois honnête sur les "
+        "valorisations si elles sont tendues."
     )
 
-    block = next(b for b in response.content if b.type == "tool_use")
-    data = dict(block.input)
-    data.pop("thesis_id", None)
-    data.pop("created_at", None)
-    data["candidate_tickers"] = tickers   # on impose les tickers du screener
-    return MacroThesis(**data)
+    # 🛡️ S6 — On passe par appel_avec_retry (redemande si un champ manque, au lieu de
+    #    crasher le cycle sur un KeyError/StopIteration) et le wrapper élargit le budget
+    #    de tokens si la réponse est tronquée. On IMPOSE nos champs via forcer_id :
+    #    les tickers viennent du screener, l'id et la date sont générés frais côté serveur.
+    these = appel_avec_retry(
+        client=client,
+        model=settings.llm_model,
+        system=SYSTEM_PROMPT,
+        user_content=user_content,
+        tool_name="soumettre_these",
+        schema=MacroThesis,
+        max_tokens=3000,                       # une MacroThesis complète (chaîne causale) est verbeuse
+        forcer_id={
+            "candidate_tickers": tickers,      # on impose les tickers du screener
+            "thesis_id": str(uuid.uuid4()),    # id frais (pas celui qu'inventerait le LLM)
+            "created_at": datetime.now(timezone.utc),
+        },
+    )
+    return these
 
 
 if __name__ == "__main__":
