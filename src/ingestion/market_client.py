@@ -136,14 +136,26 @@ def get_open_apres(ticker: str, date_ordre_iso: str) -> dict:
     if hist is None or hist.empty or "Open" not in hist.columns:
         return {"pret": False, "raison": "aucun historique de séance disponible"}
 
+    from datetime import timedelta
+
     for horodatage, ligne in hist.iterrows():
-        # L'index yfinance est daté de la SÉANCE (avec fuseau du marché).
         ts = horodatage.to_pydatetime()
+
+        # 🔑 S14 — On compare à l'instant RÉEL D'OUVERTURE de la séance (9h30 heure du
+        #    marché), PAS à l'horodatage de la barre. yfinance date la barre journalière à
+        #    MINUIT heure du marché (~04h00 UTC). Comparer cet horodatage brut faisait rater
+        #    l'ouverture du jour même à un ordre placé le matin (cron 11h UTC = 7h ET, soit
+        #    AVANT l'ouverture) : l'ordre sautait une séance entière sans raison.
+        #    En ajoutant 9h30 à la barre, on obtient l'ouverture réelle, avec l'heure d'été
+        #    gérée automatiquement par le fuseau porté par l'index.
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        # On veut la 1re séance dont l'OUVERTURE est postérieure à l'ordre.
-        # yfinance date la barre au début de séance : on compare directement.
-        if ts > t_ordre:
+            ouverture_seance = ts + timedelta(hours=13, minutes=30)   # repli : 9h30 ET ≈ 13h30 UTC
+        else:
+            ouverture_seance = ts + timedelta(hours=9, minutes=30)    # fuseau du marché : DST OK
+
+        # 1re séance dont l'OUVERTURE est postérieure au placement de l'ordre.
+        if ouverture_seance > t_ordre:
             ouverture = ligne.get("Open")
             if ouverture is None or not (ouverture == ouverture) or ouverture <= 0:  # NaN-safe
                 continue

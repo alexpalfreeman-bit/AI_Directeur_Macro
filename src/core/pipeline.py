@@ -180,12 +180,40 @@ def run_once() -> None:
         print(f"⏭️  Cycle run_news sauté — {e}")
 
 
+def _marche_ferme_weekend(maintenant: datetime | None = None) -> bool:
+    """
+    S14 — Sommes-nous un samedi ou un dimanche (UTC) ?
+
+    Le week-end, le comité LLM ne sert À RIEN et coûte cher :
+      • les prix n'ont pas bougé depuis vendredi (le Quant valide sur des chiffres figés) ;
+      • un ordre placé samedi serait rempli à l'OUVERTURE DE LUNDI ;
+      • or le cron de lundi matin (11h UTC, avant l'ouverture) lit les MÊMES news RSS et
+        place un ordre rempli à CETTE MÊME OUVERTURE DE LUNDI.
+    → Fill identique, prix identique : ZÉRO rendement perdu, 8 cycles Opus économisés
+      par week-end (4 crons × 2 jours).
+
+    On continue en revanche de faire tourner les protections mécaniques (sorties, ordres
+    en attente) : elles sont gratuites et ne doivent jamais être suspendues.
+    """
+    m = maintenant or datetime.now(timezone.utc)
+    return m.weekday() >= 5      # 5 = samedi, 6 = dimanche
+
+
 def _run_once_corps() -> None:
     # 🛡️ Protection mécanique À CHAQUE cycle, en premier — avant toute autre chose.
     executer_en_securite("Vérification des sorties (stops)", verifier_et_alerter_sorties)
     # 📸 Photo quotidienne de l'équity (idempotent par date : le dernier cron du jour gagne).
     executer_en_securite("Snapshot performance", lambda: print(snapshot_quotidien()))
     """Cycle complet. Le soir (17h), on révise d'abord les positions ; puis on cherche des idées."""
+    # 🗓️ S14 — Week-end : les protections mécaniques ci-dessus ont tourné (c'est l'essentiel).
+    #    On saute tout le comité LLM : marché fermé, prix figés, et la news sera captée lundi
+    #    matin pour un fill à la MÊME ouverture. Aucun rendement perdu, coût LLM évité.
+    if _marche_ferme_weekend():
+        print("🗓️  Week-end — marché fermé. Comité LLM sauté (aucun rendement perdu : "
+              "un ordre du week-end serait de toute façon rempli à l'ouverture de lundi, "
+              "comme le fera le cycle de lundi matin). Protections mécaniques : OK.")
+        return
+
     contexte = executer_en_securite("Lecture des actualités", construire_contexte_actu) or ""
 
     # 📋 Revue du portefeuille UNE fois par jour (voir _doit_lancer_gerant : RUN_GERANT=1
@@ -214,6 +242,12 @@ def _run_screener_corps() -> None:
     # 📸 Même photo quotidienne ici (idempotent : capte le jour même sans news).
     executer_en_securite("Snapshot performance", lambda: print(snapshot_quotidien()))
     """Cycle BOTTOM-UP : screener → thèse → comité → portefeuille → Telegram."""
+    # 🗓️ S14 — Même logique : le screener note des facteurs sur des prix figés le week-end.
+    if _marche_ferme_weekend():
+        print("🗓️  Week-end — marché fermé. Screener sauté (les facteurs seraient calculés "
+              "sur les prix de vendredi, inchangés). Protections mécaniques : OK.")
+        return
+
     from src.screener.screener_thesis import generer_these_screener
 
     print("\n🔍 === CYCLE SCREENER (bottom-up) ===")
