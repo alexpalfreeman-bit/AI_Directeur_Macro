@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     cost_bps_per_side_smallcap: float = 30.0   # small/mid caps (moins liquides)
     smallcap_cap_threshold: float = 2_000_000_000.0   # < 2 Md$ ⇒ tarif small/mid
 
+    # ── S9 — Dimensionnement par le RISQUE (et non par une taille arbitraire) ──
+    # On ne fixe plus la taille, on fixe la PERTE MAXIMALE acceptée par position.
+    # dollars = (risk_pct × équity) / distance_au_stop   → un stop large ⇒ position petite.
+    risk_sizing_actif: bool = True
+    max_position_risk_pct: float = 2.0    # % de l'équity risqué si le stop est touché
+    atr_stop_multiple: float = 1.0        # la distance au stop ne peut être < 1 × ATR(14)
+    min_ticket_usd: float = 100.0         # sous ce montant, la position est de la poussière
+
     max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
     max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)
     arbitrage_actif: bool = True

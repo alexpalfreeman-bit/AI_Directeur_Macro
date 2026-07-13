@@ -272,6 +272,25 @@ def _secteur_reel(ticker: str, repli_texte: str) -> str:
     return (repli_texte or "").strip().title() or "Inconnu"
 
 
+# ─── S9 — ATR mis en cache pour le dimensionnement par le risque ───
+_cache_atr: dict[str, float | None] = {}
+
+def _atr_ticker(ticker: str) -> float | None:
+    """ATR(14) du titre, mis en cache pour ne pas rappeler yfinance à chaque fill.
+    Import à l'appel : garde la compatibilité avec les bancs de test qui stubbent
+    market_client sans exposer get_atr."""
+    cle = ticker.upper()
+    if cle in _cache_atr:
+        return _cache_atr[cle]
+    try:
+        from src.ingestion.market_client import get_atr
+        valeur = get_atr(ticker)
+    except Exception:
+        valeur = None
+    _cache_atr[cle] = valeur
+    return valeur
+
+
 # ─── R1a — Coûts de transaction (débités du cash à CHAQUE fill) ───
 def _frais_bps(ticker: str) -> float:
     """
@@ -307,6 +326,38 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         return f"  ↪ Prix indisponible pour {ticker} — achat annulé."
     base = equity_courante(p)                       # S2 — dimensionnement sur l'ÉQUITY courante
     dollars = (size_pct / 100.0) * base
+    note_risque = ""
+
+    # ─── S9 — DIMENSIONNEMENT PAR LE RISQUE ───
+    # On ne fixe plus la taille, on fixe la PERTE MAX. Une position dont le stop est loin
+    # est plus PETITE, à budget de risque égal. Sans cela, deux positions de même taille
+    # mais aux stops différents portent des risques radicalement différents.
+    if getattr(settings, "risk_sizing_actif", False) and stop_loss and stop_loss < price:
+        distance = price - stop_loss
+
+        # 🛡️ PLANCHER ATR — le garde-fou essentiel. Un stop plus serré que la respiration
+        #    normale du titre (a) serait touché par le simple bruit, (b) ferait EXPLOSER la
+        #    taille (on divise par la distance). On ne dimensionne jamais comme si un titre
+        #    était plus calme qu'il ne l'est. L'ATR vient de yfinance — jamais du LLM.
+        atr = _atr_ticker(ticker)
+        if atr:
+            plancher = getattr(settings, "atr_stop_multiple", 1.0) * atr
+            if distance < plancher:
+                note_risque = f" | stop serré ({distance:.2f}$) planché à 1×ATR ({plancher:.2f}$)"
+                distance = plancher
+
+        budget_risque = (getattr(settings, "max_position_risk_pct", 2.0) / 100.0) * base
+        actions_max = budget_risque / distance
+        dollars_risque = actions_max * price
+
+        # On prend le MINIMUM : le risque ne peut que RÉDUIRE la taille voulue par le
+        # Directeur, jamais l'augmenter. Laisser un stop serré gonfler la position serait
+        # confier le levier au LLM — exactement ce qu'on veut éviter.
+        if dollars_risque < dollars:
+            note_risque = (f" | taille réduite par le risque ({dollars:.0f}$ → {dollars_risque:.0f}$, "
+                           f"perte max {budget_risque:.0f}$ = {getattr(settings,'max_position_risk_pct',2.0)}%)"
+                           + note_risque)
+            dollars = dollars_risque
 
     # 🛡️ Plafond par TITRE : aucun titre ne dépasse le plafond, quoi que dise le Directeur
     plafond_dollars = (settings.max_position_pct / 100.0) * base
@@ -324,6 +375,12 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         if dollars > headroom:
             dollars = headroom   # on écrête à la place restante dans le secteur
 
+    # S9 — plancher de ticket : une position de 3$ n'a aucun sens (frais > enjeu)
+    ticket_min = getattr(settings, "min_ticket_usd", 100.0)
+    if dollars < ticket_min:
+        return (f"  ↪ {ticker} écarté — taille finale trop petite ({dollars:.0f}$ < "
+                f"{ticket_min:.0f}$ minimum) après plafonds/risque.")
+
     # R1a — frais d'entrée réels, débités du cash EN PLUS du notionnel
     frais_entree = _frais(ticker, dollars)
     if dollars + frais_entree > p.cash:
@@ -340,8 +397,9 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         conviction=conviction, sector=sector, horizon_days=horizon_days,
         entry_cost=frais_entree,
     ))
+    pct_reel = (dollars / base * 100.0) if base else 0.0
     return (f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ "
-            f"({dollars:.0f}$ = {size_pct}% | frais {frais_entree:.2f}$)")
+            f"({dollars:.0f}$ = {pct_reel:.1f}% équity | frais {frais_entree:.2f}$){note_risque}")
 
 # ─── Clôturer une position ───
 def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) -> str:

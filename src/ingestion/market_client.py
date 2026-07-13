@@ -197,3 +197,46 @@ def get_seance_ohlc(ticker: str) -> dict:
     return {"ok": True, "open": round(o, 4), "high": round(h, 4),
             "low": round(l, 4), "close": round(c, 4),
             "date": horodatage.strftime("%Y-%m-%d")}
+
+
+# ─── S9 — ATR (volatilité réelle du titre), pour plancher la distance au stop ───
+def get_atr(ticker: str, periode: int = 14) -> float | None:
+    """
+    S9 — Average True Range sur `periode` séances : de combien ce titre bouge-t-il
+    NORMALEMENT en une journée, en dollars.
+
+    Pourquoi : le dimensionnement par le risque divise par la distance au stop. Si un
+    LLM propose un stop à -0,5 % sur un titre qui bouge de 3 %/jour, la formule
+    ferait exploser la taille de position ET le stop serait touché par le simple bruit.
+    L'ATR sert de PLANCHER : on ne dimensionne jamais comme si un titre était plus
+    calme qu'il ne l'est réellement.
+
+    True Range = max(H-L, |H-C_prev|, |L-C_prev|) — capture les gaps, contrairement
+    au simple H-L. Renvoie None si indisponible (l'appelant dégrade proprement).
+    """
+    symbole = resolve_ticker(ticker) or ticker
+    try:
+        hist = yf.Ticker(symbole).history(period="2mo", interval="1d")
+    except Exception:
+        return None
+
+    if hist is None or hist.empty or len(hist) < periode + 1:
+        return None
+    for col in ("High", "Low", "Close"):
+        if col not in hist.columns:
+            return None
+
+    trs = []
+    closes = hist["Close"].tolist()
+    highs = hist["High"].tolist()
+    lows = hist["Low"].tolist()
+    for i in range(1, len(hist)):
+        h, l, c_prev = highs[i], lows[i], closes[i - 1]
+        if not all(v == v for v in (h, l, c_prev)):     # NaN-safe
+            continue
+        trs.append(max(h - l, abs(h - c_prev), abs(l - c_prev)))
+
+    if len(trs) < periode:
+        return None
+    atr = sum(trs[-periode:]) / periode
+    return round(float(atr), 4) if atr and atr > 0 else None
