@@ -155,23 +155,20 @@ check("journal signale le prix indispo", any("indisponible" in l for l in log), 
 print("\n=== C1 — cas nominal : fill au PRIX RÉEL, pas au prix du LLM ===")
 # Plan LLM à 100$, marché réel à 100.5$ (dérive 0.5% < 1.5%) → on entre à 100.5$.
 log, saved = run(make_thesis(), make_decision([make_pos(entry=100.0)]), price=100.5)
-check("exactement 1 position ouverte", len(saved.positions) == 1, detail=str(log))
-if saved.positions:
-    pos = saved.positions[0]
-    check("entry_price == PRIX RÉEL (100.5), pas le prix LLM (100.0)",
-          abs(pos.entry_price - 100.5) < 1e-9,
-          detail=f"entry_price réel enregistré = {pos.entry_price}")
-    check("prix LLM (100.0) N'EST PAS utilisé", abs(pos.entry_price - 100.0) > 1e-6)
-    # dollars = 10% * 100000 = 10000 ; shares = 10000 / 100.5
-    attendu_shares = round(10_000.0 / 100.5, 4)
-    check("nb d'actions calculé sur le prix réel", abs(pos.shares - attendu_shares) < 1e-6,
-          detail=f"{pos.shares} vs {attendu_shares}")
-    check("stop/objectif/invalidation conservés du plan",
-          pos.stop_loss == 95.0 and pos.profit_target == 115.0 and pos.invalidation_price == 93.0)
+check("R1b — exactement 1 ORDRE placé (fill à l'ouverture suivante)",
+      len(saved.pending) == 1 and len(saved.positions) == 0, detail=str(log))
+if saved.pending:
+    o = saved.pending[0]
+    check("R1b — l'ordre porte le bon ticker et la bonne taille",
+          o.ticker == "XOM" and abs(o.size_pct - 10.0) < 1e-9, detail=f"{o.ticker} {o.size_pct}")
+    check("R1b — stop/objectif/invalidation du plan conservés dans l'ordre",
+          o.stop_loss == 95.0 and o.profit_target == 115.0 and o.invalidation_price == 93.0)
+    check("R1b — aucun fill immédiat : le cash n'a PAS bougé au placement",
+          abs(saved.cash - 100_000.0) < 1e-9, detail=f"cash={saved.cash}")
 
 print("\n=== C1 — dérive juste SOUS la tolérance (1.4%) : on entre quand même ===")
 log, saved = run(make_thesis(), make_decision([make_pos(entry=100.0)]), price=101.4)  # +1.4%
-check("position ouverte (dérive tolérée)", len(saved.positions) == 1, detail=str(log))
+check("R1b — ordre placé (dérive tolérée)", len(saved.pending) == 1, detail=str(log))
 
 print("\n" + ("🎉 TOUS LES TESTS PASSENT" if not echecs else f"⚠️ ÉCHECS : {echecs}"))
 sys.exit(1 if echecs else 0)

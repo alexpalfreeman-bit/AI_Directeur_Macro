@@ -131,17 +131,17 @@ def run_record(thesis, decision, prix_map):
 print("\n=== S4 — record_decision stocke le secteur yfinance (Energy), pas le texte LLM ===")
 saved = run_record(make_thesis("énergie"), make_decision([make_pos("XOM")]),
                    {"XOM": {"price": 100.0, "sector": "Energy"}})
-check("1 position ouverte", len(saved.positions) == 1)
+check("R1b — 1 ORDRE placé (fill à l'ouverture suivante)", len(saved.pending) == 1)
 if saved.positions:
     check("secteur stocké = 'Energy' (yfinance), pas 'énergie' (LLM)",
-          saved.positions[0].sector == "Energy", detail=saved.positions[0].sector)
+          saved.pending[0].sector == "Energy", detail=saved.pending[0].sector)
 
 print("\n=== S4 — repli : si yfinance n'a pas de secteur, on normalise le texte LLM ===")
 saved = run_record(make_thesis("énergie"), make_decision([make_pos("ZZZ")]),
                    {"ZZZ": {"price": 100.0, "sector": None}})
 check("secteur = 'Énergie' (texte LLM normalisé en title-case)",
-      saved.positions and saved.positions[0].sector == "Énergie",
-      detail=saved.positions[0].sector if saved.positions else "aucune position")
+      saved.pending and saved.pending[0].sector == "Énergie",
+      detail=saved.pending[0].sector if saved.pending else "aucun ordre")
 
 print("\n" + ("🎉 TOUS LES TESTS PASSENT" if not echecs else f"⚠️ ÉCHECS : {echecs}"))
 sys.exit(1 if echecs else 0)

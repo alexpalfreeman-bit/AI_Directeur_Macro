@@ -102,3 +102,52 @@ if __name__ == "__main__":
     print("\n=== Données RÉELLES récupérées (zéro hallucination) ===")
     for key, value in data.items():
         print(f"  {key:.<22} {value}")
+
+# ─── R1b — Prix d'OUVERTURE de la prochaine séance (réalisme d'exécution) ───
+def get_open_apres(ticker: str, date_ordre_iso: str) -> dict:
+    """
+    R1b — Renvoie le prix d'OUVERTURE de la première séance qui s'est ouverte
+    STRICTEMENT APRÈS `date_ordre_iso` (l'instant où l'ordre a été placé).
+
+    Pourquoi : un comité qui tourne à 17h Montréal décide marché FERMÉ. En réel,
+    l'ordre partirait à l'ouverture du lendemain, à un prix qui peut gapper. Remplir
+    au close du jour (inexécutable) flatte systématiquement le paper trading.
+
+    Renvoie :
+      {"pret": True,  "open": 123.45, "date": "2026-07-10"}  -> une séance a ouvert : on remplit
+      {"pret": False, "raison": "..."}                        -> pas encore de séance : on attend
+
+    Le prix vient de yfinance (jamais du LLM) — la règle d'or tient.
+    """
+    from datetime import datetime, timezone
+    try:
+        t_ordre = datetime.fromisoformat(date_ordre_iso)
+        if t_ordre.tzinfo is None:
+            t_ordre = t_ordre.replace(tzinfo=timezone.utc)
+    except Exception as e:
+        return {"pret": False, "raison": f"date d'ordre illisible ({e})"}
+
+    symbole = resolve_ticker(ticker) or ticker
+    try:
+        hist = yf.Ticker(symbole).history(period="10d", interval="1d")
+    except Exception as e:
+        return {"pret": False, "raison": f"yfinance indisponible ({e})"}
+
+    if hist is None or hist.empty or "Open" not in hist.columns:
+        return {"pret": False, "raison": "aucun historique de séance disponible"}
+
+    for horodatage, ligne in hist.iterrows():
+        # L'index yfinance est daté de la SÉANCE (avec fuseau du marché).
+        ts = horodatage.to_pydatetime()
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        # On veut la 1re séance dont l'OUVERTURE est postérieure à l'ordre.
+        # yfinance date la barre au début de séance : on compare directement.
+        if ts > t_ordre:
+            ouverture = ligne.get("Open")
+            if ouverture is None or not (ouverture == ouverture) or ouverture <= 0:  # NaN-safe
+                continue
+            return {"pret": True, "open": round(float(ouverture), 4),
+                    "date": ts.strftime("%Y-%m-%d")}
+
+    return {"pret": False, "raison": "aucune séance ouverte depuis l'ordre (marché fermé/week-end)"}
