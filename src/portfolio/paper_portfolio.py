@@ -389,24 +389,97 @@ def trim_position(p: Portfolio, pos: Position, exit_price: float,
     return ligne
 
 # ─── Vérifier les sorties (stop-loss / invalidation / objectif / échéance) ───
+def _prix_sortie_baissiere(niveau: float, ohlc: dict) -> float | None:
+    """
+    R1c — Un niveau de sortie BAISSIER (stop, invalidation) est-il touché en séance ?
+
+    Deux cas, et c'est toute la différence avec un test sur le close :
+      • GAP AU TRAVERS : la séance OUVRE déjà sous le niveau → en réel, l'ordre stop
+        devient un ordre au marché et s'exécute à l'OPEN, PAS au niveau du stop.
+        C'est le « slippage de gap » : la raison pour laquelle un stop ne protège
+        jamais autant qu'on le croit. On remplit donc à l'open (plus bas = plus honnête).
+      • TOUCHÉ EN SÉANCE : le Low descend jusqu'au niveau → fill AU niveau.
+
+    Renvoie le prix de sortie, ou None si le niveau n'a pas été touché.
+    """
+    if not niveau:
+        return None
+    if ohlc["open"] <= niveau:          # gap au travers : on subit l'open
+        return ohlc["open"]
+    if ohlc["low"] <= niveau:           # touché en séance : fill au niveau
+        return niveau
+    return None
+
+
+def _prix_sortie_haussiere(niveau: float, ohlc: dict) -> float | None:
+    """R1c — Symétrique pour un objectif de profit (gap au-dessus → fill à l'open)."""
+    if not niveau:
+        return None
+    if ohlc["open"] >= niveau:
+        return ohlc["open"]
+    if ohlc["high"] >= niveau:
+        return niveau
+    return None
+
+
 def check_exits(p: Portfolio) -> list[str]:
+    """
+    R1c — Les niveaux mécaniques sont testés contre le HIGH/LOW de la séance, plus
+    seulement contre le dernier prix. Un stop touché en intraday DÉCLENCHE, même si
+    le titre a rebondi avant la clôture — c'est ce qui se passerait en réel.
+
+    Ordre de priorité conservateur quand plusieurs niveaux sont touchés dans la même
+    séance : stop > invalidation > objectif. On ne peut pas savoir, sur une barre
+    journalière, si le bas a précédé le haut ; on suppose donc le PIRE (le stop d'abord).
+    Se supposer chanceux est la façon la plus courante de se mentir en backtest.
+
+    Si l'OHLC est indisponible, on retombe proprement sur l'ancien test au dernier prix.
+    """
+    from src.ingestion.market_client import get_seance_ohlc   # import à l'appel (stubs de test)
+
     alerts = []
     for pos in list(p.positions):   # copie : on modifie la liste pendant l'itération
-        price = get_fundamentals(pos.ticker).get("price")
-        if not price:
+        ohlc = get_seance_ohlc(pos.ticker)
+
+        if not ohlc.get("ok"):
+            # Repli : OHLC indisponible → ancien comportement (dernier prix connu).
+            price = get_fundamentals(pos.ticker).get("price")
+            if not price:
+                continue
+            ohlc = {"open": price, "high": price, "low": price, "close": price}
+
+        close = ohlc["close"]
+
+        # 1) STOP — le plus prioritaire (hypothèse conservatrice)
+        prix = _prix_sortie_baissiere(pos.stop_loss, ohlc)
+        if prix is not None:
+            gap = " (GAP au travers — fill à l'ouverture)" if ohlc["open"] <= pos.stop_loss else ""
+            alerts.append(f"🛑 STOP touché en séance{gap} ! "
+                          + close_position(p, pos, prix, "stop_loss"))
             continue
-        if pos.stop_loss and price <= pos.stop_loss:
-            alerts.append("🛑 STOP touché ! " + close_position(p, pos, price, "stop_loss"))
-        elif pos.invalidation_price and price <= pos.invalidation_price:
-            alerts.append("❌ THÈSE INVALIDÉE ! " + close_position(p, pos, price, "these_invalidee"))
-        elif pos.profit_target and price >= pos.profit_target:
-            alerts.append("🎯 OBJECTIF atteint ! " + close_position(p, pos, price, "profit_target"))
-        elif (pos.horizon_days and _age_jours(pos) >= pos.horizon_days
-              and price <= pos.entry_price):
-            # ⏳ La fenêtre de la thèse est passée SANS qu'elle paie : on libère le capital.
-            #    Une position GAGNANTE (price > entrée), elle, continue de courir.
+
+        # 2) INVALIDATION de la thèse
+        prix = _prix_sortie_baissiere(pos.invalidation_price, ohlc)
+        if prix is not None:
+            gap = (" (GAP au travers — fill à l'ouverture)"
+                   if pos.invalidation_price and ohlc["open"] <= pos.invalidation_price else "")
+            alerts.append(f"❌ THÈSE INVALIDÉE en séance{gap} ! "
+                          + close_position(p, pos, prix, "these_invalidee"))
+            continue
+
+        # 3) OBJECTIF de profit
+        prix = _prix_sortie_haussiere(pos.profit_target, ohlc)
+        if prix is not None:
+            alerts.append("🎯 OBJECTIF atteint en séance ! "
+                          + close_position(p, pos, prix, "profit_target"))
+            continue
+
+        # 4) ÉCHÉANCE — évaluée à la CLÔTURE (ce n'est pas un ordre au marché, mais une
+        #    décision de fin de journée : on libère le capital d'une thèse qui n'a pas payé).
+        if (pos.horizon_days and _age_jours(pos) >= pos.horizon_days
+                and close <= pos.entry_price):
             alerts.append("⏳ HORIZON ATTEINT (thèse non réalisée) ! "
-                          + close_position(p, pos, price, "horizon_expire"))
+                          + close_position(p, pos, close, "horizon_expire"))
     return alerts
 
 def verifier_sorties() -> list[str]:

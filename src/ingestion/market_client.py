@@ -151,3 +151,49 @@ def get_open_apres(ticker: str, date_ordre_iso: str) -> dict:
                     "date": ts.strftime("%Y-%m-%d")}
 
     return {"pret": False, "raison": "aucune séance ouverte depuis l'ordre (marché fermé/week-end)"}
+
+
+# ─── R1c — OHLC de la dernière séance (stops testés en INTRADAY) ───
+def get_seance_ohlc(ticker: str) -> dict:
+    """
+    R1c — Renvoie l'Open / High / Low / Close de la DERNIÈRE séance cotée.
+
+    Pourquoi : un stop n'est pas testé sur le cours de clôture. En réel, il se déclenche
+    dès que le prix TOUCHE le niveau EN SÉANCE. Un titre qui plonge à -8% intraday puis
+    clôture à -1% déclenche le stop dans la vraie vie, mais pas dans un paper qui ne
+    regarde que le close. Ignorer le Low/High flatte systématiquement les sorties.
+
+    Renvoie {"ok": True, "open":.., "high":.., "low":.., "close":.., "date": "YYYY-MM-DD"}
+    ou {"ok": False, "raison": "..."} si indisponible (l'appelant retombe alors sur le
+    dernier prix connu — dégradation propre, jamais d'exception).
+
+    Prix issus de yfinance uniquement — la règle d'or tient.
+    """
+    symbole = resolve_ticker(ticker) or ticker
+    try:
+        hist = yf.Ticker(symbole).history(period="5d", interval="1d")
+    except Exception as e:
+        return {"ok": False, "raison": f"yfinance indisponible ({e})"}
+
+    if hist is None or hist.empty:
+        return {"ok": False, "raison": "aucune séance disponible"}
+
+    for col in ("Open", "High", "Low", "Close"):
+        if col not in hist.columns:
+            return {"ok": False, "raison": f"colonne {col} absente"}
+
+    ligne = hist.iloc[-1]          # dernière séance cotée
+    try:
+        o, h, l, c = (float(ligne["Open"]), float(ligne["High"]),
+                      float(ligne["Low"]), float(ligne["Close"]))
+    except Exception as e:
+        return {"ok": False, "raison": f"OHLC illisible ({e})"}
+
+    # NaN-safe (yfinance peut renvoyer NaN sur une séance incomplète)
+    if not all(v == v and v > 0 for v in (o, h, l, c)):
+        return {"ok": False, "raison": "OHLC incomplet (NaN)"}
+
+    horodatage = hist.index[-1]
+    return {"ok": True, "open": round(o, 4), "high": round(h, 4),
+            "low": round(l, 4), "close": round(c, 4),
+            "date": horodatage.strftime("%Y-%m-%d")}
