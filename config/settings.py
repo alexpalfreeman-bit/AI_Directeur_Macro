@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     min_market_cap: float = 500_000_000      # 500 M$ : on évite les nano/micro-caps fragiles
     min_avg_volume: int = 300_000             # 300k actions/jour : liquidité minimale
 
+    # ── R1a — Coûts de transaction (débités du cash à CHAQUE fill) ──
+    # bps = points de base (1 bp = 0,01 %). Appliqués par CÔTÉ (achat ET vente) sur le
+    # notionnel (actions × prix). Tiérés par liquidité : les large caps se négocient à
+    # spread serré, les small/mid cycliques (CF, OLN, MP…) coûtent bien plus cher.
+    cost_bps_per_side: float = 10.0            # large caps (spread + slippage + timing)
+    cost_bps_per_side_smallcap: float = 30.0   # small/mid caps (moins liquides)
+    smallcap_cap_threshold: float = 2_000_000_000.0   # < 2 Md$ ⇒ tarif small/mid
+
     max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
     max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)
     arbitrage_actif: bool = True

@@ -179,9 +179,15 @@ def stats_trades(closed: list[dict], cout_bps_par_cote: float = COUT_BPS_PAR_COT
 
     lignes = []
     for c in closed:
-        notionnel = (c["entry_price"] + c["exit_price"]) * c["shares"]
-        cout = notionnel * cout_bps_par_cote / 10_000.0
         pnl_brut = c["realized_pnl"]
+        # R1a — si le portefeuille a stocké les frais RÉELS (entry_cost/exit_cost), on les
+        # utilise. Sinon (trades hérités d'avant R1a), on retombe sur l'estimation bps.
+        cout_reel = (c.get("entry_cost") or 0.0) + (c.get("exit_cost") or 0.0)
+        if cout_reel > 0:
+            cout = cout_reel
+        else:
+            notionnel = (c["entry_price"] + c["exit_price"]) * c["shares"]
+            cout = notionnel * cout_bps_par_cote / 10_000.0
         lignes.append({
             "ticker": c["ticker"],
             "pnl_brut": pnl_brut,

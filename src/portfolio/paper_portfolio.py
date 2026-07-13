@@ -129,6 +129,7 @@ class Position(BaseModel):
     horizon_days: int | None = None          # ← horizon de la thèse (jours), pour la sortie à l'échéance
     thesis_id: str = ""
     thesis_summary: str = ""
+    entry_cost: float = 0.0                  # R1a — frais réels payés à l'achat (débités du cash)
     opened_at: str = Field(default_factory=_now)
 
 
@@ -137,8 +138,10 @@ class ClosedPosition(BaseModel):
     shares: float
     entry_price: float
     exit_price: float
-    realized_pnl: float
+    realized_pnl: float                      # BRUT (différence de prix) — les coûts sont à part
     exit_reason: str
+    entry_cost: float = 0.0                   # R1a — part des frais d'entrée imputée à ce lot
+    exit_cost: float = 0.0                    # R1a — frais réels payés à la vente
     opened_at: str
     closed_at: str = Field(default_factory=_now)
 
@@ -148,6 +151,7 @@ class Portfolio(BaseModel):
     cash: float = Field(default_factory=lambda: settings.starting_capital)
     positions: list[Position] = Field(default_factory=list)
     closed: list[ClosedPosition] = Field(default_factory=list)
+    total_costs_paid: float = 0.0             # R1a — cumul des frais de transaction payés
     spy_start_price: float | None = None      # ← AJOUTE : prix du S&P au démarrage
     started_at: str = Field(default_factory=_now)   # ← AJOUTE : date de démarrage
 
@@ -246,6 +250,29 @@ def _secteur_reel(ticker: str, repli_texte: str) -> str:
     return (repli_texte or "").strip().title() or "Inconnu"
 
 
+# ─── R1a — Coûts de transaction (débités du cash à CHAQUE fill) ───
+def _frais_bps(ticker: str) -> float:
+    """
+    R1a — Coût par CÔTÉ en bps, tiéré par la liquidité (via la capitalisation yfinance,
+    déjà en cache dans le cycle). Capitalisation inconnue ⇒ tarif small-cap (biais
+    CONSERVATEUR : quand on doute, on paie plus cher — un paper trading doit se sous-flatter).
+    """
+    cap = get_fundamentals(ticker).get("market_cap")
+    seuil = getattr(settings, "smallcap_cap_threshold", 2_000_000_000.0)
+    bps_large = getattr(settings, "cost_bps_per_side", 10.0)
+    bps_small = getattr(settings, "cost_bps_per_side_smallcap", 30.0)
+    if cap is None:
+        return bps_small
+    return bps_large if cap >= seuil else bps_small
+
+
+def _frais(ticker: str, notionnel: float) -> float:
+    """Frais réels (en $) pour un côté, sur un notionnel = actions × prix."""
+    if not notionnel or notionnel <= 0:
+        return 0.0
+    return round(notionnel * _frais_bps(ticker) / 10_000.0, 2)
+
+
 def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         stop_loss: float | None, profit_target: float | None,
         thesis_id: str = "", thesis_summary: str = "",
@@ -275,30 +302,41 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         if dollars > headroom:
             dollars = headroom   # on écrête à la place restante dans le secteur
 
-    if dollars > p.cash:
-        return f"  ↪ Cash insuffisant pour {ticker} ({dollars:.0f}$ demandés, {p.cash:.0f}$ dispo)."
+    # R1a — frais d'entrée réels, débités du cash EN PLUS du notionnel
+    frais_entree = _frais(ticker, dollars)
+    if dollars + frais_entree > p.cash:
+        return (f"  ↪ Cash insuffisant pour {ticker} "
+                f"({dollars:.0f}$ + {frais_entree:.2f}$ frais, {p.cash:.0f}$ dispo).")
     shares = round(dollars / price, 4)
-    p.cash -= dollars
+    p.cash -= (dollars + frais_entree)                       # R1a — notionnel + frais
+    p.total_costs_paid = round(p.total_costs_paid + frais_entree, 2)
     p.positions.append(Position(
         ticker=ticker, shares=shares, entry_price=price,
         stop_loss=stop_loss, profit_target=profit_target,
         thesis_id=thesis_id, thesis_summary=thesis_summary,
         invalidation_price=invalidation_price,
         conviction=conviction, sector=sector, horizon_days=horizon_days,
+        entry_cost=frais_entree,
     ))
-    return f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ ({dollars:.0f}$ = {size_pct}%)"
+    return (f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ "
+            f"({dollars:.0f}$ = {size_pct}% | frais {frais_entree:.2f}$)")
 
 # ─── Clôturer une position ───
 def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) -> str:
-    pnl = round((exit_price - pos.entry_price) * pos.shares, 2)
-    p.cash += pos.shares * exit_price
+    pnl = round((exit_price - pos.entry_price) * pos.shares, 2)   # BRUT (hors frais)
+    frais_sortie = _frais(pos.ticker, pos.shares * exit_price)     # R1a
+    p.cash += pos.shares * exit_price - frais_sortie              # R1a — produit NET de frais
+    p.total_costs_paid = round(p.total_costs_paid + frais_sortie, 2)
     p.closed.append(ClosedPosition(
         ticker=pos.ticker, shares=pos.shares, entry_price=pos.entry_price,
         exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
+        entry_cost=pos.entry_cost, exit_cost=frais_sortie,
     ))
     p.positions.remove(pos)
-    signe = "+" if pnl >= 0 else ""
-    return f"  💰 VENTE {pos.ticker} @ {exit_price}$ ({reason}) → P&L {signe}{pnl}$"
+    pnl_net = round(pnl - pos.entry_cost - frais_sortie, 2)       # net des DEUX côtés
+    signe = "+" if pnl_net >= 0 else ""
+    return (f"  💰 VENTE {pos.ticker} @ {exit_price}$ ({reason}) → "
+            f"P&L net {signe}{pnl_net}$ (brut {'+' if pnl>=0 else ''}{pnl}$, frais {round(pos.entry_cost+frais_sortie,2)}$)")
 
 def trim_position(p: Portfolio, pos: Position, exit_price: float,
                   fraction: float = 0.5, reason: str = "alleger") -> str:
@@ -306,15 +344,24 @@ def trim_position(p: Portfolio, pos: Position, exit_price: float,
     shares_vendues = round(pos.shares * fraction, 4)
     if shares_vendues <= 0 or not exit_price:
         return f"  ↪ {pos.ticker} : rien à alléger."
-    pnl = round((exit_price - pos.entry_price) * shares_vendues, 2)
-    p.cash += shares_vendues * exit_price
+    pnl = round((exit_price - pos.entry_price) * shares_vendues, 2)   # BRUT
+    frais_sortie = _frais(pos.ticker, shares_vendues * exit_price)     # R1a
+    # R1a — part des frais d'entrée imputée au lot vendu (au prorata des actions)
+    part = (shares_vendues / pos.shares) if pos.shares else 0.0
+    entry_cost_lot = round(pos.entry_cost * part, 2)
+    p.cash += shares_vendues * exit_price - frais_sortie              # R1a — produit NET
+    p.total_costs_paid = round(p.total_costs_paid + frais_sortie, 2)
     p.closed.append(ClosedPosition(
         ticker=pos.ticker, shares=shares_vendues, entry_price=pos.entry_price,
         exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
+        entry_cost=entry_cost_lot, exit_cost=frais_sortie,
     ))
+    pos.entry_cost = round(pos.entry_cost - entry_cost_lot, 2)        # le reste garde sa part
     pos.shares = round(pos.shares - shares_vendues, 4)
-    signe = "+" if pnl >= 0 else ""
-    ligne = f"🔻 ALLÈGE {pos.ticker} : -{shares_vendues} actions @ {exit_price}$ → P&L {signe}{pnl}$"
+    pnl_net = round(pnl - entry_cost_lot - frais_sortie, 2)
+    signe = "+" if pnl_net >= 0 else ""
+    ligne = (f"🔻 ALLÈGE {pos.ticker} : -{shares_vendues} actions @ {exit_price}$ → "
+             f"P&L net {signe}{pnl_net}$ (frais {round(entry_cost_lot+frais_sortie,2)}$)")
     if pos.shares <= 0:              # sécurité : si tout est parti, on retire la position
         p.positions.remove(pos)
     return ligne
@@ -383,9 +430,15 @@ def snapshot_text(p: Portfolio) -> str:
         f"  🏁 Performance : {st}{perf:.1f}%",
     ]
     if p.closed:
-        pnl_r = sum(c.realized_pnl for c in p.closed)
+        pnl_r = sum(c.realized_pnl for c in p.closed)               # brut
+        frais_r = sum(getattr(c, "entry_cost", 0.0) + getattr(c, "exit_cost", 0.0) for c in p.closed)
+        pnl_net = pnl_r - frais_r
         s = "+" if pnl_r >= 0 else ""
-        lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L réalisé {s}{pnl_r:.0f}$")
+        sn = "+" if pnl_net >= 0 else ""
+        lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L brut {s}{pnl_r:.0f}$ "
+                      f"| net {sn}{pnl_net:.0f}$ (frais −{frais_r:.0f}$)")
+    if getattr(p, "total_costs_paid", 0.0) > 0:
+        lignes.append(f"  💸 Frais de transaction payés (cumul) : {p.total_costs_paid:.2f}$")
 
     # Comparaison avec le S&P 500 (avec rattrapage si le prix de départ manque)
     if not p.spy_start_price:
