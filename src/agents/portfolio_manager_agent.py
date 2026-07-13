@@ -14,6 +14,7 @@ from src.schemas.thesis import MacroThesis, QuantValidation, RiskAssessment
 from src.schemas.decision import PortfolioDecision
 from src.ingestion.market_client import get_fundamentals
 from src.memory.vector_store import recall_similar, remember_decision
+from src.analytics.calibration import texte_pour_directeur
 from src.communication.telegram_bot import send_decision_et_portefeuille
 from src.portfolio.paper_portfolio import record_decision, load_portfolio, snapshot_text
 from src.ingestion.sentiment_client import get_market_regime, regime_text
@@ -118,6 +119,14 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
 
     now = datetime.now()
 
+    # S10 — retour d'expérience CHIFFRÉ sur la calibration des convictions passées.
+    #    Best-effort : une erreur ici ne doit jamais empêcher une décision d'être prise.
+    try:
+        calibration_txt = texte_pour_directeur([c.model_dump() for c in pf.closed])
+    except Exception as e:
+        calibration_txt = "CALIBRATION : indisponible ce cycle."
+        print(f"[calibration] ⚠️ indisponible ({e}) — le comité continue.")
+
     passe = recall_similar(thesis)
     memoire_text = "Aucune décision passée comparable." if not passe else "\n".join(
         f"- [{m['meta']['action'].upper()}, conf {m['meta']['confidence']}] {m['summary'][:200]}"
@@ -133,6 +142,7 @@ def make_decision(thesis: MacroThesis, quant: QuantValidation,
         f"Liquidités disponibles : {capital_dispo}\n\n"
         f"{regime_txt}\n\n"
         f"PRIX ACTUELS DES SURVIVANTS :\n{prix_actuels}\n\n"
+        f"{calibration_txt}\n\n"
         f"MÉMOIRE — décisions passées similaires :\n{memoire_text}\n\n"
         f"--- THÈSE (Macro) ---\n{thesis.model_dump_json(indent=2)}\n\n"
         f"--- VALIDATION (Quant) ---\n{quant.model_dump_json(indent=2)}\n\n"

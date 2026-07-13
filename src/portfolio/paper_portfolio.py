@@ -146,6 +146,9 @@ class ClosedPosition(BaseModel):
     exit_reason: str
     entry_cost: float = 0.0                   # R1a — part des frais d'entrée imputée à ce lot
     exit_cost: float = 0.0                    # R1a — frais réels payés à la vente
+    conviction: float | None = None           # S10 — la conviction qui a OUVERT ce trade
+    sector: str = ""                          # S10 — secteur (calibration par secteur)
+    thesis_id: str = ""                       # S10 — lien vers la thèse d'origine
     opened_at: str
     closed_at: str = Field(default_factory=_now)
 
@@ -411,6 +414,7 @@ def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) 
         ticker=pos.ticker, shares=pos.shares, entry_price=pos.entry_price,
         exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
         entry_cost=pos.entry_cost, exit_cost=frais_sortie,
+        conviction=pos.conviction, sector=pos.sector, thesis_id=pos.thesis_id,   # S10
     ))
     p.positions.remove(pos)
     pnl_net = round(pnl - pos.entry_cost - frais_sortie, 2)       # net des DEUX côtés
@@ -435,6 +439,7 @@ def trim_position(p: Portfolio, pos: Position, exit_price: float,
         ticker=pos.ticker, shares=shares_vendues, entry_price=pos.entry_price,
         exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
         entry_cost=entry_cost_lot, exit_cost=frais_sortie,
+        conviction=pos.conviction, sector=pos.sector, thesis_id=pos.thesis_id,   # S10
     ))
     pos.entry_cost = round(pos.entry_cost - entry_cost_lot, 2)        # le reste garde sa part
     pos.shares = round(pos.shares - shares_vendues, 4)
