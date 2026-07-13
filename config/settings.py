@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     correlation_jours: int = 90             # fenêtre de calcul (rendements quotidiens)
     correlation_min_obs: int = 40           # sous ce nb d'observations, on ne conclut pas
 
+    # ── S13 — KILL-SWITCH de drawdown ──
+    # Si l'équity chute de X% sous son PIC historique, on gèle les NOUVELLES entrées.
+    # Les positions existantes continuent d'être gérées (stops, objectifs) normalement.
+    killswitch_actif: bool = True
+    max_drawdown_pct: float = 15.0      # gel des entrées au-delà de -15% depuis le pic
+    killswitch_reprise_pct: float = 10.0  # reprise quand le drawdown remonte au-dessus de -10%
+
     max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
     max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)
     arbitrage_actif: bool = True

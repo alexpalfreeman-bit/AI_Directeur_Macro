@@ -99,10 +99,25 @@ def snapshot_quotidien() -> str:
     Idempotent : appelé plusieurs fois le même jour, il écrase la même entrée
     (la DERNIÈRE photo du jour gagne — donc celle du cron du soir, après clôture).
     À appeler à la fin de CHAQUE cycle (news, screener) : coût quasi nul.
+
+    🗓️ S12 — AUCUN SNAPSHOT LE WEEK-END. Les crons tournent 7 j/7, mais le marché non.
+    Un samedi, les prix sont figés : rendement du portefeuille = 0 ET rendement du SPY = 0.
+    Ces points (0,0) sont du POISON statistique :
+      • ils gonflent artificiellement n (on croit avoir plus de données qu'en réalité) ;
+      • ils écrasent la volatilité mesurée (2 jours de zéros par semaine) et donc
+        SURESTIMENT le Sharpe annualisé en 252 jours ouvrés ;
+      • le cash « rate » le taux sans risque quotidien, ce qui ronge l'alpha de sélection.
+    On ne photographie donc que les jours ouvrés. (Les jours fériés US restent inclus —
+    biais résiduel mineur, ~9 jours/an, non corrigé faute de calendrier fiable.)
     """
     # Imports locaux : évite tout cycle et permet de tester ce module à sec.
     from src.portfolio.paper_portfolio import load_portfolio
     from src.ingestion.market_client import get_fundamentals
+
+    maintenant = datetime.now(timezone.utc)
+    if maintenant.weekday() >= 5:          # 5 = samedi, 6 = dimanche
+        return ("🗓️ Week-end — aucun snapshot (marché fermé : un point à rendement nul "
+                "fausserait la volatilité et le Sharpe).")
 
     p = load_portfolio()
     valeur_positions, tickers_prix_manquant = 0.0, []

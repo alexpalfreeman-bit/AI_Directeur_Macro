@@ -177,6 +177,8 @@ class Portfolio(BaseModel):
     closed: list[ClosedPosition] = Field(default_factory=list)
     pending: list[PendingOrder] = Field(default_factory=list)   # R1b — ordres en attente d'ouverture
     total_costs_paid: float = 0.0             # R1a — cumul des frais de transaction payés
+    equity_peak: float = 0.0                  # S13 — plus haut historique de l'équity
+    killswitch_gele: bool = False             # S13 — entrées gelées (drawdown excessif)
     spy_start_price: float | None = None      # ← AJOUTE : prix du S&P au démarrage
     started_at: str = Field(default_factory=_now)   # ← AJOUTE : date de démarrage
 
@@ -389,6 +391,12 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         return f"  ↪ {ticker} déjà en portefeuille — on n'ajoute pas."
     if not price or price <= 0:
         return f"  ↪ Prix indisponible pour {ticker} — achat annulé."
+
+    # ─── S13 — KILL-SWITCH : aucune nouvelle entrée pendant un drawdown sévère ───
+    if getattr(settings, "killswitch_actif", False) and p.killswitch_gele:
+        return (f"  🚨 {ticker} REFUSÉ — kill-switch actif (drawdown > "
+                f"{getattr(settings, 'max_drawdown_pct', 15.0):.0f}% depuis le pic). "
+                f"Aucune nouvelle entrée tant que le portefeuille n'est pas redressé.")
 
     # ─── S11 — GARDE DE CORRÉLATION ───
     # Les plafonds sectoriels croient diversifier ; la corrélation dit la vérité. Trois titres
@@ -622,6 +630,61 @@ def check_exits(p: Portfolio) -> list[str]:
                           + close_position(p, pos, close, "horizon_expire"))
     return alerts
 
+def maj_killswitch(p: Portfolio) -> list[str]:
+    """
+    S13 — KILL-SWITCH DE DRAWDOWN.
+
+    Met à jour le pic d'équity et gèle les NOUVELLES entrées si le portefeuille est tombé
+    de plus de `max_drawdown_pct` sous ce pic. Les positions existantes continuent d'être
+    gérées normalement (stops, objectifs, échéances) — on ne liquide RIEN, on arrête
+    seulement de creuser.
+
+    Pourquoi : c'est la règle que tout gérant institutionnel a et qu'un système autonome
+    n'a pas. Sans elle, un pipeline qui tourne 3×/jour peut enchaîner les entrées perdantes
+    pendant des semaines, sans qu'aucun humain n'ait à valider. Le kill-switch est le
+    disjoncteur.
+
+    HYSTÉRÉSIS : on gèle à -15%, mais on ne reprend qu'à -10%. Sans cet écart, une équity
+    qui oscille autour du seuil ferait clignoter le système (gel/dégel à chaque cycle).
+    """
+    if not getattr(settings, "killswitch_actif", False):
+        return []
+
+    equity = equity_courante(p)
+    if equity <= 0:
+        return []
+
+    # Le pic ne descend jamais (c'est un plus-haut historique).
+    if equity > p.equity_peak:
+        p.equity_peak = round(equity, 2)
+    if p.equity_peak <= 0:
+        p.equity_peak = round(equity, 2)
+        return []
+
+    drawdown_pct = (equity / p.equity_peak - 1) * 100      # négatif en drawdown
+    seuil_gel = -abs(getattr(settings, "max_drawdown_pct", 15.0))
+    seuil_reprise = -abs(getattr(settings, "killswitch_reprise_pct", 10.0))
+
+    journal = []
+    if not p.killswitch_gele and drawdown_pct <= seuil_gel:
+        p.killswitch_gele = True
+        journal.append(
+            f"🚨 KILL-SWITCH ACTIVÉ — drawdown {drawdown_pct:.1f}% depuis le pic "
+            f"({p.equity_peak:.0f}$ → {equity:.0f}$). NOUVELLES ENTRÉES GELÉES. "
+            f"Les positions existantes restent gérées (stops/objectifs actifs). "
+            f"Reprise automatique au-dessus de {seuil_reprise:.0f}%.")
+    elif p.killswitch_gele and drawdown_pct > seuil_reprise:
+        p.killswitch_gele = False
+        journal.append(
+            f"✅ KILL-SWITCH LEVÉ — drawdown revenu à {drawdown_pct:.1f}% "
+            f"(> {seuil_reprise:.0f}%). Les nouvelles entrées reprennent.")
+    elif p.killswitch_gele:
+        journal.append(
+            f"🚨 Entrées toujours GELÉES — drawdown {drawdown_pct:.1f}% "
+            f"(reprise au-dessus de {seuil_reprise:.0f}%).")
+    return journal
+
+
 def verifier_sorties() -> list[str]:
     """
     Protection mécanique indépendante : charge le portefeuille, exécute les ordres en
@@ -635,9 +698,10 @@ def verifier_sorties() -> list[str]:
     p = load_portfolio()
     fills = executer_ordres_en_attente(p)     # R1b — remplissage à l'OUVERTURE
     sorties = check_exits(p)
-    if fills or sorties:
+    alerte_ks = maj_killswitch(p)             # S13 — disjoncteur de drawdown
+    if fills or sorties or alerte_ks:
         save_portfolio(p)
-    return fills + sorties
+    return fills + sorties + alerte_ks
 
 # ─── Photo du portefeuille (valeur + performance) ───
 def snapshot_text(p: Portfolio) -> str:
@@ -676,6 +740,10 @@ def snapshot_text(p: Portfolio) -> str:
         sn = "+" if pnl_net >= 0 else ""
         lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L brut {s}{pnl_r:.0f}$ "
                       f"| net {sn}{pnl_net:.0f}$ (frais −{frais_r:.0f}$)")
+    if getattr(p, "killswitch_gele", False):
+        lignes.append(f"  🚨 KILL-SWITCH ACTIF — nouvelles entrées gelées "
+                      f"(drawdown > {getattr(settings, 'max_drawdown_pct', 15.0):.0f}% "
+                      f"depuis le pic de {p.equity_peak:.0f}$)")
     if getattr(p, "pending", None):
         lignes.append(f"  📝 Ordres en attente d'ouverture : "
                       + ", ".join(f"{o.ticker} ({o.size_pct}%)" for o in p.pending))
