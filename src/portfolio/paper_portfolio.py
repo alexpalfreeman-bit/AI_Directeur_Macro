@@ -275,7 +275,69 @@ def _secteur_reel(ticker: str, repli_texte: str) -> str:
     return (repli_texte or "").strip().title() or "Inconnu"
 
 
-# ─── S9 — ATR mis en cache pour le dimensionnement par le risque ───
+# ─── S11 — Diversification par la CORRÉLATION réelle ───
+def _correlation_portefeuille(p: Portfolio, candidat: str) -> tuple[float | None, str]:
+    """
+    S11 — Corrélation MOYENNE PONDÉRÉE du candidat avec le portefeuille existant.
+
+    Pondérée par la valeur de marché : une corrélation de 0,85 avec une position qui pèse
+    12% du portefeuille est bien plus dangereuse que la même corrélation avec une ligne à 1%.
+    Une moyenne simple masquerait ce fait.
+
+    Renvoie (correlation, detail) ; (None, raison) si non calculable — auquel cas
+    l'appelant LAISSE PASSER (on ne bloque jamais un achat sur une donnée manquante :
+    ce serait transformer une panne yfinance en règle de gestion).
+    """
+    if not p.positions:
+        return (None, "portefeuille vide")
+
+    detenus = [pos.ticker for pos in p.positions if pos.ticker.upper() != candidat.upper()]
+    if not detenus:
+        return (None, "aucune autre position")
+
+    try:
+        from src.ingestion.market_client import get_correlations
+        res = get_correlations(
+            candidat, detenus,
+            jours=getattr(settings, "correlation_jours", 90),
+            min_obs=getattr(settings, "correlation_min_obs", 40),
+        )
+    except Exception as e:
+        return (None, f"calcul indisponible ({e})")
+
+    if not res.get("ok"):
+        return (None, res.get("raison", "indisponible"))
+
+    correls = res["correlations"]
+    if not correls:
+        return (None, "aucune corrélation calculable")
+
+    # Pondération par la valeur de marché de chaque position détenue.
+    total_poids = 0.0
+    somme = 0.0
+    pires: list[tuple[str, float]] = []
+    for pos in p.positions:
+        c = correls.get(pos.ticker)
+        if c is None:
+            continue
+        prix = get_fundamentals(pos.ticker).get("price") or pos.entry_price
+        poids = pos.shares * prix
+        if poids <= 0:
+            continue
+        somme += c * poids
+        total_poids += poids
+        pires.append((pos.ticker, c))
+
+    if total_poids <= 0:
+        return (None, "poids nuls")
+
+    moyenne = somme / total_poids
+    pires.sort(key=lambda x: x[1], reverse=True)
+    detail = ", ".join(f"{t} {c:+.2f}" for t, c in pires[:3])
+    return (round(moyenne, 3), detail)
+
+
+
 _cache_atr: dict[str, float | None] = {}
 
 def _atr_ticker(ticker: str) -> float | None:
@@ -327,6 +389,21 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         return f"  ↪ {ticker} déjà en portefeuille — on n'ajoute pas."
     if not price or price <= 0:
         return f"  ↪ Prix indisponible pour {ticker} — achat annulé."
+
+    # ─── S11 — GARDE DE CORRÉLATION ───
+    # Les plafonds sectoriels croient diversifier ; la corrélation dit la vérité. Trois titres
+    # dans trois "secteurs" peuvent être un SEUL pari macro (la demande cyclique). Si le
+    # candidat est trop corrélé au livre existant, on ne diversifie pas : on DOUBLE la mise.
+    if getattr(settings, "correlation_active", False) and p.positions:
+        correl, detail = _correlation_portefeuille(p, ticker)
+        seuil = getattr(settings, "max_correlation_moyenne", 0.65)
+        if correl is not None and correl > seuil:
+            return (f"  ⛔ {ticker} écarté — corrélation moyenne {correl:+.2f} avec le "
+                    f"portefeuille (> {seuil:.2f}) : ce n'est pas une diversification, "
+                    f"c'est le même pari en double. Plus corrélés : {detail}.")
+        # correl is None → donnée indisponible : on LAISSE PASSER (une panne yfinance ne
+        # doit pas devenir une règle de gestion), mais on le dit dans le journal.
+
     base = equity_courante(p)                       # S2 — dimensionnement sur l'ÉQUITY courante
     dollars = (size_pct / 100.0) * base
     note_risque = ""

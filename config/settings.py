@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     atr_stop_multiple: float = 1.0        # la distance au stop ne peut être < 1 × ATR(14)
     min_ticket_usd: float = 100.0         # sous ce montant, la position est de la poussière
 
+    # ── S11 — Diversification par la CORRÉLATION (et non par les étiquettes de secteur) ──
+    # Deux titres de secteurs différents peuvent être un seul pari macro. Seule la
+    # corrélation des rendements réels le révèle.
+    correlation_active: bool = True
+    max_correlation_moyenne: float = 0.65   # au-delà, le candidat double un pari existant
+    correlation_jours: int = 90             # fenêtre de calcul (rendements quotidiens)
+    correlation_min_obs: int = 40           # sous ce nb d'observations, on ne conclut pas
+
     max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
     max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)
     arbitrage_actif: bool = True

@@ -240,3 +240,87 @@ def get_atr(ticker: str, periode: int = 14) -> float | None:
         return None
     atr = sum(trs[-periode:]) / periode
     return round(float(atr), 4) if atr and atr > 0 else None
+
+
+# ─── S11 — Corrélations réelles (diversification par les CHIFFRES, pas par les étiquettes) ───
+_cache_correlations: dict[str, float] = {}     # clé "A|B" (triée) -> corrélation
+
+
+def get_correlations(candidat: str, detenus: list[str],
+                     jours: int = 90, min_obs: int = 40) -> dict:
+    """
+    S11 — Corrélation des rendements QUOTIDIENS entre un candidat et les titres détenus.
+
+    Pourquoi : deux titres de secteurs DIFFÉRENTS (OXY=Energy, FCX=Materials, CAT=Industrials)
+    peuvent être un SEUL pari macro (la demande cyclique). Les plafonds sectoriels ne voient
+    rien. Seule la corrélation des rendements réels dit la vérité sur la diversification.
+
+    Renvoie {"ok": True, "correlations": {"OXY": 0.72, ...}} ou {"ok": False, "raison": ...}.
+    Les corrélations sont mises en cache par paire (le calcul est identique dans un cycle).
+
+    Chiffres yfinance uniquement — la règle d'or tient.
+    """
+    if not detenus:
+        return {"ok": True, "correlations": {}}
+
+    # 1) Ce qui est déjà en cache (par paire) n'est pas rechargé.
+    resultats: dict[str, float] = {}
+    a_calculer: list[str] = []
+    for t in detenus:
+        cle = "|".join(sorted([candidat.upper(), t.upper()]))
+        if cle in _cache_correlations:
+            resultats[t] = _cache_correlations[cle]
+        elif t.upper() != candidat.upper():
+            a_calculer.append(t)
+
+    if not a_calculer:
+        return {"ok": True, "correlations": resultats}
+
+    # 2) Téléchargement GROUPÉ (un seul appel réseau, pas un par titre).
+    symboles = [resolve_ticker(candidat) or candidat] + \
+               [resolve_ticker(t) or t for t in a_calculer]
+    try:
+        data = yf.download(symboles, period=f"{max(jours, 60)}d", interval="1d",
+                           progress=False, auto_adjust=True, group_by="column")
+    except Exception as e:
+        return {"ok": False, "raison": f"téléchargement échoué ({e})"}
+
+    if data is None or data.empty:
+        return {"ok": False, "raison": "aucune donnée de prix"}
+
+    try:
+        closes = data["Close"] if "Close" in data.columns else data
+    except Exception:
+        return {"ok": False, "raison": "colonne Close introuvable"}
+
+    # Un seul symbole → pandas renvoie une Series : on la remet en DataFrame.
+    if hasattr(closes, "to_frame") and closes.ndim == 1:
+        closes = closes.to_frame()
+
+    rendements = closes.pct_change().dropna(how="all")
+    sym_candidat = resolve_ticker(candidat) or candidat
+    if sym_candidat not in rendements.columns:
+        return {"ok": False, "raison": f"pas de série pour {candidat}"}
+
+    serie_c = rendements[sym_candidat]
+
+    for t in a_calculer:
+        sym_t = resolve_ticker(t) or t
+        if sym_t not in rendements.columns:
+            continue
+        paire = rendements[[sym_candidat, sym_t]].dropna()
+        if len(paire) < min_obs:      # trop peu d'observations : on ne prétend rien
+            continue
+        try:
+            c = float(paire[sym_candidat].corr(paire[sym_t]))
+        except Exception:
+            continue
+        if c != c:                     # NaN-safe (titre à variance nulle)
+            continue
+        c = round(c, 3)
+        resultats[t] = c
+        _cache_correlations["|".join(sorted([candidat.upper(), t.upper()]))] = c
+
+    if not resultats:
+        return {"ok": False, "raison": "aucune corrélation calculable (historique insuffisant)"}
+    return {"ok": True, "correlations": resultats}
