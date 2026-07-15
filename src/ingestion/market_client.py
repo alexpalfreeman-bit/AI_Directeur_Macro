@@ -59,6 +59,22 @@ def get_fundamentals(ticker: str, utiliser_cache: bool = True) -> dict:
             "data_source": "indisponible",
         }
 
+    # 🛡️ C6 — yfinance peut renvoyer None SANS lever d'exception (throttling, réponse vide).
+    #    Le try/except ci-dessus ne voit alors RIEN passer, et le code continuait avec
+    #    info = None → `info.get(...)` → "'NoneType' object has no attribute 'get'", qui
+    #    faisait tomber la vérification des stops ET le snapshot. On valide donc les TYPES,
+    #    pas seulement l'absence d'exception : ne jamais faire confiance à une API externe.
+    if not isinstance(info, dict) or hist is None:
+        print(f"  ⚠️  Réponse yfinance vide/invalide pour {cle} (probable throttling) "
+              f"— ticker ignoré ce cycle.")
+        return {
+            "ticker": cle.upper(), "name": None, "price": None,
+            "pe_ratio": None, "debt_to_equity": None, "revenue_growth_yoy": None,
+            "market_cap": None, "sector": None, "volatility_30d_pct": None,
+            "ev_to_ebitda": None, "price_to_book": None, "avg_volume": None,
+            "data_source": "indisponible",
+        }
+
     if not hist.empty:
         daily_returns = hist["Close"].pct_change().dropna()
         volatility_30d = round(daily_returns.std() * 100, 2)  # en %
@@ -166,6 +182,9 @@ def get_open_apres(ticker: str, date_ordre_iso: str) -> dict:
 
 
 # ─── R1c — OHLC de la dernière séance (stops testés en INTRADAY) ───
+_CACHE_OHLC: dict[str, dict] = {}      # C6 — un seul appel par ticker et par processus
+
+
 def get_seance_ohlc(ticker: str) -> dict:
     """
     R1c — Renvoie l'Open / High / Low / Close de la DERNIÈRE séance cotée.
@@ -182,6 +201,14 @@ def get_seance_ohlc(ticker: str) -> dict:
     Prix issus de yfinance uniquement — la règle d'or tient.
     """
     symbole = resolve_ticker(ticker) or ticker
+
+    # C6 — Cache par processus : R1c appelle cette fonction pour CHAQUE position à CHAQUE
+    #    cycle. Avec 13 positions × 3 crons/jour, cela multipliait les appels yfinance et
+    #    déclenchait du throttling (qui faisait ensuite planter get_fundamentals).
+    #    Un SUCCÈS est mémorisé ; un échec ne l'est pas (le throttling est transitoire).
+    if symbole in _CACHE_OHLC:
+        return _CACHE_OHLC[symbole]
+
     try:
         hist = yf.Ticker(symbole).history(period="5d", interval="1d")
     except Exception as e:
@@ -206,9 +233,11 @@ def get_seance_ohlc(ticker: str) -> dict:
         return {"ok": False, "raison": "OHLC incomplet (NaN)"}
 
     horodatage = hist.index[-1]
-    return {"ok": True, "open": round(o, 4), "high": round(h, 4),
-            "low": round(l, 4), "close": round(c, 4),
-            "date": horodatage.strftime("%Y-%m-%d")}
+    resultat = {"ok": True, "open": round(o, 4), "high": round(h, 4),
+                "low": round(l, 4), "close": round(c, 4),
+                "date": horodatage.strftime("%Y-%m-%d")}
+    _CACHE_OHLC[symbole] = resultat        # C6 — succès mémorisé pour le reste du processus
+    return resultat
 
 
 # ─── S9 — ATR (volatilité réelle du titre), pour plancher la distance au stop ───

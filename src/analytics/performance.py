@@ -122,7 +122,7 @@ def snapshot_quotidien() -> str:
     p = load_portfolio()
     valeur_positions, tickers_prix_manquant = 0.0, []
     for pos in p.positions:
-        prix = get_fundamentals(pos.ticker).get("price")
+        prix = (get_fundamentals(pos.ticker) or {}).get("price")
         if prix:
             valeur_positions += pos.shares * prix
         else:

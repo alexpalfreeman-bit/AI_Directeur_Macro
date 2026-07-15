@@ -187,7 +187,7 @@ class Portfolio(BaseModel):
 def _nouveau_portefeuille() -> Portfolio:
     """Crée un portefeuille neuf en figeant le prix de départ du S&P 500."""
     p = Portfolio()
-    spy = get_fundamentals("SPY").get("price")
+    spy = (get_fundamentals("SPY") or {}).get("price")
     p.spy_start_price = spy
     return p
 
@@ -250,7 +250,7 @@ def save_portfolio(p: Portfolio) -> None:
 # ─── S2/S4 — Bases de décision : équity courante & exposition en valeur de marché ───
 def _prix_courant(ticker: str, repli: float) -> float:
     """Prix marché courant (via le cache market_client), repli sur le coût d'entrée si indispo."""
-    prix = get_fundamentals(ticker).get("price")
+    prix = (get_fundamentals(ticker) or {}).get("price")
     return prix if (prix and prix > 0) else repli
 
 
@@ -273,7 +273,7 @@ def _expo_secteur(p: "Portfolio", secteur: str) -> float:
 def _secteur_reel(ticker: str, repli_texte: str) -> str:
     """S4 — Secteur STANDARDISÉ via yfinance (Energy, Technology…) au lieu du texte libre du
     LLM. Repli : le texte de la thèse normalisé (title-case) si yfinance ne renvoie rien."""
-    s = get_fundamentals(ticker).get("sector")
+    s = (get_fundamentals(ticker) or {}).get("sector")
     if s:
         return s
     return (repli_texte or "").strip().title() or "Inconnu"
@@ -324,7 +324,7 @@ def _correlation_portefeuille(p: Portfolio, candidat: str) -> tuple[float | None
         c = correls.get(pos.ticker)
         if c is None:
             continue
-        prix = get_fundamentals(pos.ticker).get("price") or pos.entry_price
+        prix = (get_fundamentals(pos.ticker) or {}).get("price") or pos.entry_price
         poids = pos.shares * prix
         if poids <= 0:
             continue
@@ -367,7 +367,7 @@ def _frais_bps(ticker: str) -> float:
     déjà en cache dans le cycle). Capitalisation inconnue ⇒ tarif small-cap (biais
     CONSERVATEUR : quand on doute, on paie plus cher — un paper trading doit se sous-flatter).
     """
-    cap = get_fundamentals(ticker).get("market_cap")
+    cap = (get_fundamentals(ticker) or {}).get("market_cap")
     seuil = getattr(settings, "smallcap_cap_threshold", 2_000_000_000.0)
     bps_large = getattr(settings, "cost_bps_per_side", 10.0)
     bps_small = getattr(settings, "cost_bps_per_side_smallcap", 30.0)
@@ -589,11 +589,11 @@ def check_exits(p: Portfolio) -> list[str]:
 
     alerts = []
     for pos in list(p.positions):   # copie : on modifie la liste pendant l'itération
-        ohlc = get_seance_ohlc(pos.ticker)
+        ohlc = get_seance_ohlc(pos.ticker) or {}   # C6 — jamais confiance à une API
 
         if not ohlc.get("ok"):
             # Repli : OHLC indisponible → ancien comportement (dernier prix connu).
-            price = get_fundamentals(pos.ticker).get("price")
+            price = (get_fundamentals(pos.ticker) or {}).get("price")
             if not price:
                 continue
             ohlc = {"open": price, "high": price, "low": price, "close": price}
@@ -712,7 +712,7 @@ def snapshot_text(p: Portfolio) -> str:
     if not p.positions:
         lignes.append("  (Aucune position ouverte)")
     for pos in p.positions:
-        price = get_fundamentals(pos.ticker).get("price")
+        price = (get_fundamentals(pos.ticker) or {}).get("price")
         if price:
             pnl = (price - pos.entry_price) * pos.shares
             pnl_pct = (price / pos.entry_price - 1) * 100
@@ -754,13 +754,13 @@ def snapshot_text(p: Portfolio) -> str:
 
     # Comparaison avec le S&P 500 (avec rattrapage si le prix de départ manque)
     if not p.spy_start_price:
-        spy_init = get_fundamentals("SPY").get("price")
+        spy_init = (get_fundamentals("SPY") or {}).get("price")
         if spy_init:
             p.spy_start_price = spy_init
             save_portfolio(p)   # on fige enfin le point de départ
 
     if p.spy_start_price:
-        spy_now = get_fundamentals("SPY").get("price")
+        spy_now = (get_fundamentals("SPY") or {}).get("price")
         if spy_now:
             perf_spy = (spy_now / p.spy_start_price - 1) * 100
             alpha = perf - perf_spy
@@ -835,7 +835,7 @@ def tenter_arbitrage(p: Portfolio, plan) -> tuple[bool, list[str]]:
         return False, log
 
     # Prix courants (une seule fois) pour le départage et le calcul du produit de vente
-    prix_courants = {pos.ticker: get_fundamentals(pos.ticker).get("price") for pos in candidats}
+    prix_courants = {pos.ticker: (get_fundamentals(pos.ticker) or {}).get("price") for pos in candidats}
 
     # La plus FAIBLE = conviction la plus basse ; départage par proximité d'invalidation
     faible = min(candidats, key=lambda pos: (
@@ -904,7 +904,7 @@ def tenter_arbitrage_sectoriel(p: Portfolio, plan, secteur: str) -> tuple[bool, 
         log.append(f"  ↪ Arbitrage sectoriel « {secteur} » impossible : aucune position éligible dans ce secteur.")
         return False, log
 
-    prix_courants = {pos.ticker: get_fundamentals(pos.ticker).get("price") for pos in candidats}
+    prix_courants = {pos.ticker: (get_fundamentals(pos.ticker) or {}).get("price") for pos in candidats}
     faible = min(candidats, key=lambda pos: (
         pos.conviction, _proximite_invalidation(pos, prix_courants.get(pos.ticker))
     ))

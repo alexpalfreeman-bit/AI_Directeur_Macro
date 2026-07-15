@@ -99,7 +99,7 @@ def _regime_tag(regime) -> str:
 def make_decision(thesis: MacroThesis, quant: QuantValidation,
                   risk: RiskAssessment) -> PortfolioDecision:
     prix_actuels = "\n".join(
-        f"- {tk} : prix actuel = {get_fundamentals(tk).get('price')} $"
+        f"- {tk} : prix actuel = {(get_fundamentals(tk) or {}).get('price')} $"
         for tk in quant.surviving_tickers
     )
 
