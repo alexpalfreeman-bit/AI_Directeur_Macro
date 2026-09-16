@@ -56,6 +56,32 @@ class Settings(BaseSettings):
     max_drawdown_pct: float = 15.0      # gel des entrées au-delà de -15% depuis le pic
     killswitch_reprise_pct: float = 10.0  # reprise quand le drawdown remonte au-dessus de -10%
 
+    # ── S15 — Stops calibrés sur la VOLATILITÉ RÉELLE ──
+    # Audit sur 153 trades : 6 stops (-10,2 % de rendement moyen, 12 j de détention) contre
+    # 6 objectifs atteints (+16,9 %, 41 j). Les stops étaient DANS le bruit quotidien du titre.
+    # S9 planchait la distance pour la TAILLE ; S15 déplace le STOP lui-même.
+    stop_elargissement_actif: bool = True
+    stop_atr_multiple_min: float = 2.0     # le stop est repoussé à au moins 2 × ATR(14)
+
+    # ── S15 — Bridage du Gérant (audit : 134 allègements sur 153 sorties, lot MÉDIAN 25 $) ──
+    # Deux positions de 400-600 $ ont été allégées 17 FOIS chacune → 0,003 $ restants.
+    # 5 des 13 positions ouvertes valent moins de 100 $. Ce n'est pas de la gestion,
+    # c'est de la destruction de valeur par friction.
+    gerant_delai_min_jours: int = 10       # pas d'allègement avant N jours de détention
+    gerant_min_allegement_usd: float = 300.0   # sous ce montant, on garde (le frais mange l'enjeu)
+    gerant_max_allegements: int = 2        # au-delà, le Gérant doit VENDRE ou GARDER
+
+    # ── T1 — Régime de fréquence (audit : 66 % des comités finissent en WATCHLIST) ──
+    # Un comité pendant la séance ou après la clôture place un ordre rempli à l'ouverture
+    # de DEMAIN — exactement comme le ferait le cycle pré-ouverture de demain, mais avec
+    # MOINS d'information. Il est donc strictement dominé : on ne délibère qu'AVANT l'ouverture.
+    comite_pre_ouverture_seulement: bool = True
+    # Déduplication : un thème déjà jugé WATCHLIST/REJECT récemment n'est pas rejugé
+    # (audit : « Répression réglementaire bancaire » proposé 9 fois, « Vide de crédit
+    # bancaire régional » 7 fois — chaque fois un comité complet, Opus compris).
+    dedup_fenetre_h: int = 48
+    dedup_similarite_min: float = 0.45
+
     max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
     max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)
     arbitrage_actif: bool = True

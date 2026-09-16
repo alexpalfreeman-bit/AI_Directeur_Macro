@@ -7,6 +7,7 @@ C'est le point d'entrée de tout le système.
 import asyncio
 
 from src.ingestion.news_client import fetch_headlines, is_macro_relevant
+from config.settings import settings
 from src.agents.macro_agent import generate_thesis
 from src.agents.quant_agent import validate_thesis
 from src.agents.devils_advocate_agent import challenge_thesis
@@ -18,7 +19,7 @@ from src.portfolio.paper_portfolio import (
 from src.communication.telegram_bot import send_decision_et_portefeuille, send_text
 from src.ingestion.news_client import fetch_headlines, is_macro_relevant, corroborer_actualites
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from src.memory.world_memory import enregistrer_evenement
 from src.analytics.performance import snapshot_quotidien
@@ -84,6 +85,12 @@ def lancer_comite(contexte_actu: str) -> None:
     thesis = generate_thesis(contexte_actu)
     print(f"     Thème : {thesis.theme[:70]}...")
     print(f"     Tickers : {thesis.candidate_tickers} | Confiance : {thesis.confidence}")
+    # 🔁 T1 — un thème déjà jugé sans suite récemment n'est pas rejugé (Quant + Avocat + Opus
+    #    économisés). Le Macro a tourné (il fallait bien connaître le thème), mais on s'arrête là.
+    motif = _these_deja_jugee(thesis)
+    if motif:
+        print(f"⏭️  Comité interrompu — {motif}")
+        return
     lancer_comite_sur_these(thesis)
 
 def lancer_comite_sur_these(thesis) -> None:
@@ -199,6 +206,84 @@ def _marche_ferme_weekend(maintenant: datetime | None = None) -> bool:
     return m.weekday() >= 5      # 5 = samedi, 6 = dimanche
 
 
+def _fenetre_marche(maintenant: datetime | None = None) -> str:
+    """
+    T1 — Où en est la séance, en heure LOCALE de Montréal (DST-correct) ?
+    Renvoie 'pre_ouverture' (< 9h30), 'seance' (9h30–16h) ou 'post_cloture' (≥ 16h).
+
+    Pourquoi ça compte : R1b remplit les ordres à l'OUVERTURE de la prochaine séance.
+      • Comité PRÉ-OUVERTURE (7h) → ordre rempli à l'ouverture d'AUJOURD'HUI. ✅ Utile.
+      • Comité EN SÉANCE (12h) ou POST-CLÔTURE (17h) → ordre rempli à l'ouverture de
+        DEMAIN… exactement comme le fera le comité pré-ouverture de demain, qui aura en
+        plus vu la fin de séance et la nuit. Ces comités sont STRICTEMENT DOMINÉS.
+    Audit : 3,8 comités/jour, 66 % en WATCHLIST → ~0,70 $/jour de LLM jetés.
+    """
+    if maintenant is None:
+        try:
+            maintenant = datetime.now(ZoneInfo("America/Montreal"))
+        except Exception:
+            maintenant = datetime.now(timezone.utc)
+    h, m = maintenant.hour, maintenant.minute
+    if h < 9 or (h == 9 and m < 30):
+        return "pre_ouverture"
+    if h < 16:
+        return "seance"
+    return "post_cloture"
+
+
+def _these_deja_jugee(thesis) -> str | None:
+    """
+    T1 — Ce thème a-t-il DÉJÀ été jugé WATCHLIST/REJECT récemment ?
+
+    Audit sur 190 décisions : 129 thèmes distincts seulement. « Répression réglementaire
+    bancaire » proposé 9 fois, « Vide de crédit bancaire régional » 7 fois… Les mêmes titres
+    RSS persistent d'un cycle à l'autre, l'agent Macro régénère la même thèse, et un comité
+    COMPLET (Quant + Avocat + Opus) rejuge ce qui a déjà été jugé.
+
+    On compare lexicalement le thème aux décisions des `dedup_fenetre_h` dernières heures
+    (mémoire RAG, déjà persistée). Si une décision similaire s'est soldée par WATCHLIST ou
+    REJECT, on saute la suite du comité : rien de nouveau ne justifie de re-délibérer.
+    Un thème EXECUTE n'est PAS filtré ici : le portefeuille a ses propres anti-doublons.
+
+    Renvoie le motif du saut, ou None s'il faut délibérer. Best-effort : toute erreur → None.
+    """
+    try:
+        from src.memory.vector_store import _charger_enregistrements, _tokeniser, _similarite
+        from collections import Counter
+        import re
+        fenetre_h = getattr(settings, "dedup_fenetre_h", 48)
+        seuil = getattr(settings, "dedup_similarite_min", 0.45)
+        limite = datetime.now(timezone.utc) - timedelta(hours=fenetre_h)
+        q = Counter(_tokeniser(thesis.theme))
+        if not q:
+            return None
+        meilleur = (0.0, None, None)
+        for r in _charger_enregistrements():
+            meta = r.get("metadata") or {}
+            if str(meta.get("action", "")).lower() not in ("watchlist", "reject"):
+                continue
+            try:
+                t = datetime.fromisoformat(meta.get("decided_at", ""))
+                if t.tzinfo is None:
+                    t = t.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if t < limite:
+                continue
+            m = re.search(r"Thème: (.*?)\. Secteur", r.get("document", ""))
+            theme_passe = m.group(1) if m else r.get("document", "")[:200]
+            sim = _similarite(q, _tokeniser(theme_passe))
+            if sim > meilleur[0]:
+                meilleur = (sim, meta.get("action"), theme_passe[:60])
+        if meilleur[0] >= seuil:
+            return (f"thème déjà jugé {str(meilleur[1]).upper()} il y a < {fenetre_h}h "
+                    f"(similarité {meilleur[0]:.2f}) : « {meilleur[2]}… »")
+        return None
+    except Exception as e:
+        print(f"[dedup] indisponible ({e}) — on délibère normalement.")
+        return None
+
+
 def _run_once_corps() -> None:
     # 🛡️ Protection mécanique À CHAQUE cycle, en premier — avant toute autre chose.
     executer_en_securite("Vérification des sorties (stops)", verifier_et_alerter_sorties)
@@ -214,6 +299,17 @@ def _run_once_corps() -> None:
               "comme le fera le cycle de lundi matin). Protections mécaniques : OK.")
         return
 
+    # ⏱️ T1 — EN SÉANCE : aucun LLM. Les protections mécaniques ci-dessus (fills à l'open,
+    #    stops intraday, snapshot) ont tourné — c'est tout ce qu'un cycle de milieu de journée
+    #    a d'utile. Un comité ici serait rempli à l'ouverture de DEMAIN, comme celui de demain
+    #    matin, mais avec moins d'information.
+    fenetre = _fenetre_marche()
+    if fenetre == "seance" and getattr(settings, "comite_pre_ouverture_seulement", True):
+        print("⏱️  Séance en cours — cycle mécanique uniquement (fills, stops, snapshot). "
+              "Comité différé au prochain cycle pré-ouverture : une décision prise maintenant "
+              "serait remplie à l'ouverture de DEMAIN, exactement comme celle de demain matin.")
+        return
+
     contexte = executer_en_securite("Lecture des actualités", construire_contexte_actu) or ""
 
     # 📋 Revue du portefeuille UNE fois par jour (voir _doit_lancer_gerant : RUN_GERANT=1
@@ -221,6 +317,13 @@ def _run_once_corps() -> None:
     #    Isolée : même si la lecture des actualités a échoué, le Gérant révise quand même.
     if _doit_lancer_gerant():
         executer_en_securite("Revue du Gérant", revue_gerant, contexte)
+
+    # 🌙 T1 — POST-CLÔTURE : le Gérant a fait sa revue (c'est SA fenêtre). Le comité, lui,
+    #    est reporté à demain matin : même ouverture pour le fill, plus d'information.
+    if fenetre == "post_cloture" and getattr(settings, "comite_pre_ouverture_seulement", True):
+        print("🌙 Post-clôture — comité reporté au cycle pré-ouverture de demain "
+              "(même prix de fill, plus d'information). Gérant et protections : OK.")
+        return
 
     if not contexte:
         print("   Aucune actualité macro significative — pas de nouvelle idée aujourd'hui.")

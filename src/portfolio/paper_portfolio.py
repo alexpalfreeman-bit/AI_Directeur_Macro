@@ -136,6 +136,7 @@ class Position(BaseModel):
     thesis_id: str = ""
     thesis_summary: str = ""
     entry_cost: float = 0.0                  # R1a — frais réels payés à l'achat (débités du cash)
+    n_allegements: int = 0                   # S15 — nb d'allègements déjà subis (anti-charcutage)
     opened_at: str = Field(default_factory=_now)
 
 
@@ -418,6 +419,28 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
     dollars = (size_pct / 100.0) * base
     note_risque = ""
 
+    # ─── S15 — LE STOP LUI-MÊME est repoussé hors du bruit ───
+    # Audit 153 trades : 6 stops à -10,2 % (12 j de détention) contre 6 objectifs à +16,9 %
+    # (41 j). Les stops du Directeur étaient à l'intérieur de la respiration normale du
+    # titre : le bruit quotidien les déclenchait avant que la thèse ait une chance.
+    # Différence avec S9 : S9 corrigeait la distance pour la TAILLE (le stop restait
+    # serré et sautait quand même). S15 DÉPLACE le stop. ATR = yfinance, jamais le LLM.
+    if (getattr(settings, "stop_elargissement_actif", False)
+            and stop_loss and stop_loss < price):
+        atr = _atr_ticker(ticker)
+        if atr:
+            mult = getattr(settings, "stop_atr_multiple_min", 2.0)
+            stop_minimal = price - mult * atr
+            if stop_loss > stop_minimal:               # trop PRÈS du prix → on l'écarte
+                ancien_stop = stop_loss
+                stop_loss = round(stop_minimal, 2)
+                note_risque = (f" | stop élargi {ancien_stop:.2f}$ → {stop_loss:.2f}$ "
+                               f"({mult:.0f}×ATR : hors du bruit quotidien)")
+                # Une invalidation au-dessus du nouveau stop se déclencherait avant lui
+                # et rendrait l'élargissement inopérant : on l'aligne.
+                if invalidation_price and invalidation_price > stop_loss:
+                    invalidation_price = stop_loss
+
     # ─── S9 — DIMENSIONNEMENT PAR LE RISQUE ───
     # On ne fixe plus la taille, on fixe la PERTE MAX. Une position dont le stop est loin
     # est plus PETITE, à budget de risque égal. Sans cela, deux positions de même taille
@@ -433,7 +456,7 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         if atr:
             plancher = getattr(settings, "atr_stop_multiple", 1.0) * atr
             if distance < plancher:
-                note_risque = f" | stop serré ({distance:.2f}$) planché à 1×ATR ({plancher:.2f}$)"
+                note_risque += f" | distance de calcul planchée à 1×ATR ({plancher:.2f}$)"
                 distance = plancher
 
         budget_risque = (getattr(settings, "max_position_risk_pct", 2.0) / 100.0) * base
@@ -444,9 +467,8 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         # Directeur, jamais l'augmenter. Laisser un stop serré gonfler la position serait
         # confier le levier au LLM — exactement ce qu'on veut éviter.
         if dollars_risque < dollars:
-            note_risque = (f" | taille réduite par le risque ({dollars:.0f}$ → {dollars_risque:.0f}$, "
-                           f"perte max {budget_risque:.0f}$ = {getattr(settings,'max_position_risk_pct',2.0)}%)"
-                           + note_risque)
+            note_risque += (f" | taille réduite par le risque ({dollars:.0f}$ → "
+                            f"{dollars_risque:.0f}$, perte max {budget_risque:.0f}$)")
             dollars = dollars_risque
 
     # 🛡️ Plafond par TITRE : aucun titre ne dépasse le plafond, quoi que dise le Directeur
@@ -509,6 +531,58 @@ def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) 
     return (f"  💰 VENTE {pos.ticker} @ {exit_price}$ ({reason}) → "
             f"P&L net {signe}{pnl_net}$ (brut {'+' if pnl>=0 else ''}{pnl}$, frais {round(pos.entry_cost+frais_sortie,2)}$)")
 
+def allegement_autorise(pos: Position, prix: float, fraction: float = 0.5) -> tuple[bool, str]:
+    """
+    S15 — Ce Gérant a-t-il le DROIT d'alléger cette position maintenant ?
+
+    Audit sur 153 trades : 134 sorties sur 153 étaient des `gerant_alleger`, lot MÉDIAN 25 $.
+    CUBI et WAL (400-600 $) allégées 17 FOIS chacune → 0,003 $ restants. 5 des 13 positions
+    ouvertes valent < 100 $. Le Gérant découpait les mêmes lignes en tranches, payait le
+    spread à chaque fois, et gonflait artificiellement le nombre de « trades » (153 lignes
+    pour 29 positions réelles), ce qui polluait toutes les statistiques.
+
+    Trois verrous, tous justifiés par ces chiffres :
+      1. DÉLAI  — pas d'allègement avant N jours : une thèse à horizon « mois » doit respirer.
+      2. MONTANT — sous un seuil, le frais mange l'enjeu : on ne vend pas 25 $ d'actions.
+      3. RÉPÉTITION — au-delà de N allègements, la position est soit à VENDRE, soit à GARDER.
+         La rogner indéfiniment n'est pas une décision, c'est une hésitation.
+    Renvoie (autorisé, raison_du_refus).
+    """
+    delai_min = getattr(settings, "gerant_delai_min_jours", 10)
+    age = _age_jours(pos)
+    if age < delai_min:
+        return (False, f"détenue depuis {age}j seulement (< {delai_min}j) — on laisse la thèse respirer")
+    max_alleg = getattr(settings, "gerant_max_allegements", 2)
+    if pos.n_allegements >= max_alleg:
+        return (False, f"déjà allégée {pos.n_allegements}× (max {max_alleg}) — il faut VENDRE ou GARDER, pas rogner")
+    montant = pos.shares * fraction * (prix or 0.0)
+    seuil = getattr(settings, "gerant_min_allegement_usd", 300.0)
+    if montant < seuil:
+        return (False, f"allègement de {montant:.0f}$ < {seuil:.0f}$ — les frais mangeraient l'enjeu")
+    return (True, "")
+
+
+def backfill_secteurs(p: Portfolio) -> list[str]:
+    """
+    S15 — Normalise le champ `sector` des positions ouvertes (vide ou libellé LIBRE du LLM).
+    Audit : la plus grosse position (EG, 1 400 $ = 14 % du capital) n'a AUCUN secteur, et
+    ECPG porte « Financial Services — Distressed Credit & Debt Collection » au lieu de la
+    taxonomie yfinance. Conséquence : plafond sectoriel et garde de corrélation (S11)
+    travaillent à l'aveugle sur ces lignes. Auto-cicatrisant à chaque cycle.
+    """
+    journal = []
+    for pos in p.positions:
+        actuel = (pos.sector or "").strip()
+        libelle_libre = len(actuel) > 24 or any(c in actuel for c in ("—", "/", ","))
+        if actuel and actuel.lower() not in ("inconnu", "various", "n/a") and not libelle_libre:
+            continue
+        officiel = (get_fundamentals(pos.ticker) or {}).get("sector")
+        if officiel and officiel != actuel:
+            pos.sector = officiel
+            journal.append(f"  🏷️ {pos.ticker} : secteur normalisé « {actuel or 'vide'} » → « {officiel} »")
+    return journal
+
+
 def trim_position(p: Portfolio, pos: Position, exit_price: float,
                   fraction: float = 0.5, reason: str = "alleger") -> str:
     """Vend une FRACTION d'une position (moitié par défaut) et garde le reste."""
@@ -530,6 +604,7 @@ def trim_position(p: Portfolio, pos: Position, exit_price: float,
     ))
     pos.entry_cost = round(pos.entry_cost - entry_cost_lot, 2)        # le reste garde sa part
     pos.shares = round(pos.shares - shares_vendues, 4)
+    pos.n_allegements += 1                                            # S15 — anti-charcutage
     pnl_net = round(pnl - entry_cost_lot - frais_sortie, 2)
     signe = "+" if pnl_net >= 0 else ""
     ligne = (f"🔻 ALLÈGE {pos.ticker} : -{shares_vendues} actions @ {exit_price}$ → "
@@ -701,9 +776,10 @@ def verifier_sorties() -> list[str]:
     fills = executer_ordres_en_attente(p)     # R1b — remplissage à l'OUVERTURE
     sorties = check_exits(p)
     alerte_ks = maj_killswitch(p)             # S13 — disjoncteur de drawdown
-    if fills or sorties or alerte_ks:
+    secteurs = backfill_secteurs(p)           # S15 — plafonds/corrélation ne travaillent plus à l'aveugle
+    if fills or sorties or alerte_ks or secteurs:
         save_portfolio(p)
-    return fills + sorties + alerte_ks
+    return fills + sorties + alerte_ks + secteurs
 
 # ─── Photo du portefeuille (valeur + performance) ───
 def snapshot_text(p: Portfolio) -> str:

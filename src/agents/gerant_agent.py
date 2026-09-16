@@ -10,6 +10,7 @@ from config.settings import settings
 from src.agents.tool_helper import appel_avec_retry
 from src.ingestion.market_client import get_fundamentals
 from src.portfolio.paper_portfolio import (
+    allegement_autorise,
     load_portfolio, save_portfolio, close_position, trim_position,
     snapshot_text, Position,
 )
@@ -101,8 +102,15 @@ def appliquer_revue(contexte_actu: str = "") -> list[str]:
                 journal.append(f"  ⚠️ {pos.ticker} : VENDRE voulu mais prix indispo — on garde par prudence.")
         elif action == "alleger":
             if price:
-                journal.append(trim_position(p, pos, price, 0.5, "gerant_alleger"))
-                journal.append(f"     ↳ {verdict.raison}")
+                # 🛡️ S15 — Le verdict du LLM ne suffit plus : 134 des 153 sorties de l'audit
+                #    étaient des allègements (lot médian 25 $). On vérifie mécaniquement que
+                #    l'allègement a un SENS (délai, montant, répétition) avant de l'exécuter.
+                autorise, motif = allegement_autorise(pos, price, 0.5)
+                if autorise:
+                    journal.append(trim_position(p, pos, price, 0.5, "gerant_alleger"))
+                    journal.append(f"     ↳ {verdict.raison}")
+                else:
+                    journal.append(f"  ⏸️ {pos.ticker} : allègement BLOQUÉ — {motif}.")
             else:
                 journal.append(f"  ⚠️ {pos.ticker} : ALLÉGER voulu mais prix indispo — on garde.")
         else:  # garder
