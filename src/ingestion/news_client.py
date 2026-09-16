@@ -19,14 +19,12 @@ RSS_FEEDS = [
     # — Banques centrales / statistiques officielles —
     "https://www.federalreserve.gov/feeds/press_all.xml",           # Fed
     "https://www.ecb.europa.eu/rss/press.html",                     # BCE
-    ####"https://www.bls.gov/feed/bls_latest.rss",                      # BLS (emploi, inflation US)
     # — Marchés / économie US —
     "https://www.cnbc.com/id/20910258/device/rss/rss.html",         # CNBC Economy
     "https://feeds.content.dowjones.io/public/rss/mw_topstories",   # MarketWatch
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",                # WSJ Markets
     # — Énergie / métaux / matières premières —
     "https://oilprice.com/rss/main",                                # OilPrice
-    ####"https://www.mining.com/feed/",                                 # Mining.com (cuivre, lithium, or)
     "https://news.google.com/rss/search?q=(commodities+OR+oil+OR+copper+OR+lithium+OR+uranium)+when:1d&hl=en-US&gl=US&ceid=US:en",
     # — Chaînes d'approvisionnement / commerce —
     "https://www.freightwaves.com/news/feed",                       # FreightWaves (fret, logistique)
@@ -36,6 +34,9 @@ RSS_FEEDS = [
 ]
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+# 🔁 R2 — même résilience 529/429/5xx que les agents : sans cela, une surcharge
+#    faisait silencieusement rejeter un titre comme « non pertinent ».
+from src.agents.tool_helper import _appeler_api
 
 
 def fetch_headlines(max_per_feed: int = 4) -> list[dict]:
@@ -72,7 +73,8 @@ def is_macro_relevant(title: str) -> bool:
         f"Titre : « {title} »"
     )
     try:
-        msg = client.messages.create(
+        msg = _appeler_api(
+            client,
             model=settings.cheap_model,
             max_tokens=5,
             messages=[{"role": "user", "content": prompt}],
@@ -104,7 +106,8 @@ def corroborer_actualites(headlines: list[dict]) -> str:
         f"TITRES :\n{titres_numerotes}"
     )
     try:
-        msg = client.messages.create(
+        msg = _appeler_api(
+            client,
             model=settings.cheap_model,
             max_tokens=600,
             messages=[{"role": "user", "content": prompt}],

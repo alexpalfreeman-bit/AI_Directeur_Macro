@@ -14,7 +14,7 @@ from src.portfolio.paper_portfolio import (
     load_portfolio, save_portfolio, close_position, trim_position,
     snapshot_text, Position,
 )
-from src.schemas.revue import RevuePosition
+from src.schemas.revue import RevuePosition, RevuePortefeuille
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
@@ -40,6 +40,18 @@ Principes non négociables :
 - Une perte latente seule ne justifie pas de vendre si la thèse tient encore ; un gain
   latent seul ne justifie pas de vendre si la thèse a encore du chemin.
 - Sois décisif et concis : un verdict clair, une raison courte.
+
+CONTRAINTES MÉCANIQUES (le système les applique après toi — n'y perds pas de verdicts) :
+- ALLÉGER est REFUSÉ si la position a moins de 10 jours, si le lot vendu ferait moins de
+  300 $, ou si elle a déjà été allégée 2 fois. Dans ces cas, ton choix réel est GARDER
+  ou VENDRE. Un ALLÉGER qui sera refusé est un verdict perdu.
+- Les stops et objectifs sont surveillés automatiquement chaque jour : tu n'as PAS à
+  vendre « parce que le stop approche ». Tu vends parce que la THÈSE est cassée.
+
+Tu vois le portefeuille ENTIER. Profites-en : si deux positions portent le même pari
+(ex. plusieurs banques régionales), juge-les ensemble — c'est la concentration qu'on
+gère, pas seulement chaque ligne. Rends un verdict pour CHAQUE ticker listé ; un ticker
+absent de ta réponse sera traité comme GARDER.
 """
 
 EMOJI = {"garder": "🟢", "alleger": "🟡", "vendre": "🔴"}
@@ -85,12 +97,80 @@ def revoir_position(pos: Position, contexte_actu: str = "") -> tuple[RevuePositi
     return verdict, data
 
 
+def revoir_portefeuille(positions: list[Position], contexte_actu: str = "") -> tuple[dict, dict]:
+    """
+    G1 — Révise TOUTES les positions en UN SEUL appel LLM.
+
+    Renvoie (verdicts_par_ticker, donnees_par_ticker). Un ticker absent de la réponse
+    reçoit GARDER (le choix sûr). Un ticker inconnu renvoyé par le LLM est ignoré.
+    """
+    donnees: dict[str, dict] = {}
+    blocs: list[str] = []
+    for i, pos in enumerate(positions, 1):
+        data = get_fundamentals(pos.ticker) or {}
+        donnees[pos.ticker.upper()] = data
+        price = data.get("price")
+        pnl_pct = round((price / pos.entry_price - 1) * 100, 1) if price else None
+        resume = (pos.thesis_summary or "(résumé non disponible)")[:260]
+        blocs.append(
+            f"[{i}] {pos.ticker} — secteur {pos.sector or 'inconnu'} — détenue {_age_jours(pos)} j "
+            f"— déjà allégée {getattr(pos, 'n_allegements', 0)}×\n"
+            f"    Thèse : {resume}\n"
+            f"    Entrée {pos.entry_price}$ | Stop {pos.stop_loss}$ | Objectif {pos.profit_target}$ | "
+            f"Invalidation {pos.invalidation_price}$\n"
+            f"    ACTUEL : {price}$ (P&L latent {pnl_pct}%) | PE {data.get('pe_ratio')} | "
+            f"EV/EBITDA {data.get('ev_to_ebitda')} | Dette/cap {data.get('debt_to_equity')} | "
+            f"Vol 30j {data.get('volatility_30d_pct')}%"
+        )
+    bloc_actu = f"\nACTUALITÉ RÉCENTE :\n{contexte_actu}\n" if contexte_actu else ""
+    user_content = (
+        f"PORTEFEUILLE À RÉVISER — {len(positions)} position(s). Chiffres réels (yfinance) ; "
+        f"n'utilise QUE ceux-ci.\n\n" + "\n\n".join(blocs) + "\n" + bloc_actu +
+        "\nRends un verdict (GARDER / ALLÉGER / VENDRE) pour CHAQUE ticker via "
+        "'rendre_revue_portefeuille', avec une conviction restante (0 à 1) et une raison courte."
+    )
+    # Budget de sortie : ~150 tokens par verdict, borné (S6 double automatiquement si tronqué).
+    revue = appel_avec_retry(
+        client=client, model=settings.llm_model, system=SYSTEM_PROMPT,
+        user_content=user_content, tool_name="rendre_revue_portefeuille",
+        schema=RevuePortefeuille, max_tokens=min(600 + 160 * len(positions), 4000),
+    )
+    connus = {pos.ticker.upper() for pos in positions}
+    verdicts: dict[str, RevuePosition] = {}
+    for v in revue.verdicts:
+        t = (v.ticker or "").upper().strip()
+        if t in connus:
+            verdicts[t] = v
+        else:
+            print(f"  ⚠️ Gérant : verdict sur un ticker inconnu ignoré ({v.ticker}).")
+    return verdicts, donnees
+
+
+def _age_jours(pos: Position) -> int:
+    from datetime import datetime, timezone
+    try:
+        t = datetime.fromisoformat(pos.opened_at)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return max(0, (datetime.now(timezone.utc) - t).days)
+    except Exception:
+        return 0
+
+
 def appliquer_revue(contexte_actu: str = "") -> list[str]:
     """Révise CHAQUE position ouverte et APPLIQUE le verdict au portefeuille."""
     p = load_portfolio()
     journal = []
+    if not p.positions:
+        return journal
+    # G1 — UN appel pour tout le portefeuille (au lieu d'un par position).
+    verdicts, donnees = revoir_portefeuille(list(p.positions), contexte_actu)
     for pos in list(p.positions):        # copie : on modifie la liste pendant l'itération
-        verdict, data = revoir_position(pos, contexte_actu)
+        verdict = verdicts.get(pos.ticker.upper())
+        if verdict is None:
+            journal.append(f"🟢 {pos.ticker} → GARDER (aucun verdict rendu : choix sûr)")
+            continue
+        data = donnees.get(pos.ticker.upper(), {})
         price = data.get("price")
         action = verdict.action.value
 

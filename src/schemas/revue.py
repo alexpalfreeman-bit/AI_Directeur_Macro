@@ -21,3 +21,12 @@ class RevuePosition(BaseModel):
     action: ActionGerant
     conviction_restante: float = Field(..., ge=0.0, le=1.0)
     raison: str
+
+class RevuePortefeuille(BaseModel):
+    """G1 — Les verdicts du Gérant sur TOUTES les positions, en UNE réponse.
+
+    Avant : un appel LLM par position (13 positions = 13 appels Sonnet/jour, ~0,33 $).
+    Maintenant : un seul appel qui voit le portefeuille ENTIER — ce qui est aussi
+    meilleur sur le fond : le Gérant peut arbitrer entre positions (deux lignes sur le
+    même thème, concentration) au lieu de juger chacune isolément."""
+    verdicts: list[RevuePosition] = Field(default_factory=list)
