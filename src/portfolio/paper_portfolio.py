@@ -137,6 +137,7 @@ class Position(BaseModel):
     thesis_summary: str = ""
     entry_cost: float = 0.0                  # R1a — frais réels payés à l'achat (débités du cash)
     n_allegements: int = 0                   # S15 — nb d'allègements déjà subis (anti-charcutage)
+    regime: str = ""                         # V2 — version du régime à l'ouverture (attribution)
     opened_at: str = Field(default_factory=_now)
 
 
@@ -152,6 +153,7 @@ class ClosedPosition(BaseModel):
     conviction: float | None = None           # S10 — la conviction qui a OUVERT ce trade
     sector: str = ""                          # S10 — secteur (calibration par secteur)
     thesis_id: str = ""                       # S10 — lien vers la thèse d'origine
+    regime: str = ""                          # V2 — régime sous lequel la position a été ouverte
     opened_at: str
     closed_at: str = Field(default_factory=_now)
 
@@ -343,6 +345,15 @@ def _correlation_portefeuille(p: Portfolio, candidat: str) -> tuple[float | None
 
 
 
+# ─── V2 — Déploiement du capital ───
+def deploiement_pct(p: Portfolio) -> float:
+    """Part de l'équity investie en positions (0-100). Audit : ~40 % de facto pendant 77 jours."""
+    eq = equity_courante(p)
+    if eq <= 0:
+        return 0.0
+    return max(0.0, min(100.0, (eq - p.cash) / eq * 100.0))
+
+
 _cache_atr: dict[str, float | None] = {}
 
 def _atr_ticker(ticker: str) -> float | None:
@@ -416,8 +427,21 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         # doit pas devenir une règle de gestion), mais on le dit dans le journal.
 
     base = equity_courante(p)                       # S2 — dimensionnement sur l'ÉQUITY courante
-    dollars = (size_pct / 100.0) * base
     note_risque = ""
+
+    # ─── V2 — PLANCHER DE TAILLE tant que le capital est sous la cible de déploiement ───
+    # Audit : le Directeur choisissait 3-6 % ; ses six meilleurs trades (+17 %) étaient à 4 %.
+    # Un système qui a raison mais qui mise petit laisse son alpha sur la table.
+    # Le plancher ne s'applique QUE sous la cible (on ne surcharge pas un portefeuille plein)
+    # et reste soumis au plafond dur, au budget de risque et à la garde de corrélation.
+    cible = getattr(settings, "deploiement_cible_pct", 0.0)
+    plancher = getattr(settings, "taille_min_position_pct", 0.0)
+    if plancher and cible and deploiement_pct(p) < cible and size_pct < plancher:
+        note_risque += (f" | taille relevée {size_pct:.1f}% → {plancher:.0f}% "
+                        f"(déploiement {deploiement_pct(p):.0f}% < cible {cible:.0f}%)")
+        size_pct = plancher
+
+    dollars = (size_pct / 100.0) * base
 
     # ─── S15 — LE STOP LUI-MÊME est repoussé hors du bruit ───
     # Audit 153 trades : 6 stops à -10,2 % (12 j de détention) contre 6 objectifs à +16,9 %
@@ -508,6 +532,7 @@ def buy(p: Portfolio, ticker: str, price: float, size_pct: float,
         invalidation_price=invalidation_price,
         conviction=conviction, sector=sector, horizon_days=horizon_days,
         entry_cost=frais_entree,
+        regime=getattr(settings, "regime_version", ""),   # V2 — attribution
     ))
     pct_reel = (dollars / base * 100.0) if base else 0.0
     return (f"  ✅ ACHAT {ticker} : {shares} actions @ {price}$ "
@@ -524,12 +549,41 @@ def close_position(p: Portfolio, pos: Position, exit_price: float, reason: str) 
         exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
         entry_cost=pos.entry_cost, exit_cost=frais_sortie,
         conviction=pos.conviction, sector=pos.sector, thesis_id=pos.thesis_id,   # S10
+        regime=getattr(pos, "regime", ""),                                        # V2
     ))
     p.positions.remove(pos)
     pnl_net = round(pnl - pos.entry_cost - frais_sortie, 2)       # net des DEUX côtés
     signe = "+" if pnl_net >= 0 else ""
     return (f"  💰 VENTE {pos.ticker} @ {exit_price}$ ({reason}) → "
             f"P&L net {signe}{pnl_net}$ (brut {'+' if pnl>=0 else ''}{pnl}$, frais {round(pos.entry_cost+frais_sortie,2)}$)")
+
+def nettoyer_poussiere(p: Portfolio) -> list[str]:
+    """
+    V2 — Liquide les positions devenues des MIETTES (valeur < poussiere_seuil_usd).
+
+    Audit : 5 des 13 positions ouvertes valaient < 100 $ (JPM 25 $, BAC 25 $, ECPG 16 $…),
+    résidus de 15-17 allègements successifs. Une miette n'a aucun sens économique : ses frais
+    dépassent son enjeu, elle occupe un « slot » de diversification, et elle pollue le
+    compte de positions que regardent les plafonds et la garde de corrélation.
+
+    Une VRAIE position ne peut pas tomber sous ce seuil sans avoir été stoppée avant
+    (ticket minimum 100 $, stops à -6/-10 %) : ce balai ne touche que les résidus.
+    Motif de sortie dédié (`poussiere`) pour que les statistiques les excluent.
+    """
+    seuil = getattr(settings, "poussiere_seuil_usd", 0.0)
+    if not seuil:
+        return []
+    journal = []
+    for pos in list(p.positions):
+        prix = (get_fundamentals(pos.ticker) or {}).get("price")
+        if not prix:
+            continue                       # sans prix on ne vend pas à l'aveugle
+        valeur = pos.shares * prix
+        if valeur < seuil:
+            journal.append(f"  🧹 {pos.ticker} : miette de {valeur:.0f}$ liquidée — "
+                           + close_position(p, pos, prix, "poussiere").strip())
+    return journal
+
 
 def allegement_autorise(pos: Position, prix: float, fraction: float = 0.5) -> tuple[bool, str]:
     """
@@ -601,6 +655,7 @@ def trim_position(p: Portfolio, pos: Position, exit_price: float,
         exit_price=exit_price, realized_pnl=pnl, exit_reason=reason, opened_at=pos.opened_at,
         entry_cost=entry_cost_lot, exit_cost=frais_sortie,
         conviction=pos.conviction, sector=pos.sector, thesis_id=pos.thesis_id,   # S10
+        regime=getattr(pos, "regime", ""),                                        # V2
     ))
     pos.entry_cost = round(pos.entry_cost - entry_cost_lot, 2)        # le reste garde sa part
     pos.shares = round(pos.shares - shares_vendues, 4)
@@ -777,9 +832,10 @@ def verifier_sorties() -> list[str]:
     sorties = check_exits(p)
     alerte_ks = maj_killswitch(p)             # S13 — disjoncteur de drawdown
     secteurs = backfill_secteurs(p)           # S15 — plafonds/corrélation ne travaillent plus à l'aveugle
-    if fills or sorties or alerte_ks or secteurs:
+    miettes = nettoyer_poussiere(p)           # V2 — les résidus du charcutage sont liquidés
+    if fills or sorties or alerte_ks or secteurs or miettes:
         save_portfolio(p)
-    return fills + sorties + alerte_ks + secteurs
+    return fills + sorties + alerte_ks + secteurs + miettes
 
 # ─── Photo du portefeuille (valeur + performance) ───
 def snapshot_text(p: Portfolio) -> str:
@@ -818,6 +874,9 @@ def snapshot_text(p: Portfolio) -> str:
         sn = "+" if pnl_net >= 0 else ""
         lignes.append(f"  📜 Trades clôturés : {len(p.closed)} | P&L brut {s}{pnl_r:.0f}$ "
                       f"| net {sn}{pnl_net:.0f}$ (frais −{frais_r:.0f}$)")
+    cible = getattr(settings, "deploiement_cible_pct", 0)
+    if cible:
+        lignes.append(f"  🎯 Déploiement : {deploiement_pct(p):.0f}% investi (cible {cible:.0f}%)")
     if getattr(p, "killswitch_gele", False):
         lignes.append(f"  🚨 KILL-SWITCH ACTIF — nouvelles entrées gelées "
                       f"(drawdown > {getattr(settings, 'max_drawdown_pct', 15.0):.0f}% "

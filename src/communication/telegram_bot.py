@@ -35,10 +35,35 @@ def format_decision(thesis: MacroThesis, decision: PortfolioDecision) -> str:
     return "\n".join(lignes)
 
 
+LIMITE_TELEGRAM = 4000   # la limite dure est 4096 ; marge pour les emojis multi-octets
+
+
+def _decouper(message: str, limite: int = LIMITE_TELEGRAM) -> list[str]:
+    """V2 — Découpe un long message en morceaux ≤ limite, en coupant sur des sauts de
+    ligne. Le rapport hebdo + la calibration dépassent 4 096 caractères : sans ça,
+    Telegram renvoie BadRequest et le rapport n'arrive jamais."""
+    if len(message) <= limite:
+        return [message]
+    morceaux, courant = [], ""
+    for ligne in message.split("\n"):
+        if len(courant) + len(ligne) + 1 > limite:
+            if courant:
+                morceaux.append(courant)
+            courant = ligne[:limite]
+        else:
+            courant = f"{courant}\n{ligne}" if courant else ligne
+    if courant:
+        morceaux.append(courant)
+    return morceaux
+
+
 async def send_text(message: str) -> None:
-    """Envoie un simple message texte (client Bot frais, sûr en boucle)."""
+    """Envoie un message texte, découpé en plusieurs envois s'il dépasse la limite Telegram."""
     async with Bot(token=settings.telegram_bot_token) as bot:
-        await bot.send_message(chat_id=settings.telegram_chat_id, text=message)
+        morceaux = _decouper(message)
+        for i, m in enumerate(morceaux, 1):
+            suffixe = f"\n\n({i}/{len(morceaux)})" if len(morceaux) > 1 else ""
+            await bot.send_message(chat_id=settings.telegram_chat_id, text=m + suffixe)
 
 
 async def send_decision_et_portefeuille(thesis, decision, portefeuille_text: str) -> None:

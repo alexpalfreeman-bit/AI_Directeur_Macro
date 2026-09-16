@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # On ne fixe plus la taille, on fixe la PERTE MAXIMALE acceptée par position.
     # dollars = (risk_pct × équity) / distance_au_stop   → un stop large ⇒ position petite.
     risk_sizing_actif: bool = True
-    max_position_risk_pct: float = 2.0    # % de l'équity risqué si le stop est touché
+    max_position_risk_pct: float = 3.0    # V2 — 3 % (était 2 %) : posture agressive assumée
     atr_stop_multiple: float = 1.0        # la distance au stop ne peut être < 1 × ATR(14)
     min_ticket_usd: float = 100.0         # sous ce montant, la position est de la poussière
 
@@ -81,6 +81,16 @@ class Settings(BaseSettings):
     # bancaire régional » 7 fois — chaque fois un comité complet, Opus compris).
     dedup_fenetre_h: int = 48
     dedup_similarite_min: float = 0.45
+
+    # ── V2 — RÉGIME AGRESSIF (2026-09-16) — décision de l'investisseur ──
+    # Audit sur 77 jours : +3,8 % vs S&P +2,2 % avec seulement ~40 % du capital déployé
+    # (66 % des comités en WATCHLIST). On pousse le déploiement, PAS la prise de risque
+    # par titre : plafond 15 %/titre, kill-switch, corrélation et stops 2×ATR inchangés.
+    regime_version: str = "v2-2026-09-16"  # étiquette posée sur chaque position (attribution)
+    deploiement_cible_pct: float = 65.0    # cible de capital investi (était ~40 % de facto)
+    taille_min_position_pct: float = 6.0   # sous la cible, aucune position < 6 % (le Directeur
+                                           # choisissait 3-6 % ; les gagnants +17 % étaient à 4 %)
+    poussiere_seuil_usd: float = 50.0      # une position < 50 $ est liquidée (miettes du charcutage)
 
     max_position_pct: float = 15.0   # aucun titre ne dépasse 15% du capital (garde-fou dur)
     max_sector_pct: float = 40.0    # exposition max par secteur (% du capital de départ)

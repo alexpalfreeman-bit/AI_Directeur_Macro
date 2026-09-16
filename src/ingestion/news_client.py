@@ -9,16 +9,36 @@ import anthropic
 from config.settings import settings
 
 # Flux RSS macro/éco. Si l'un casse un jour, retire-le ou remplace-le.
+# V2 — Flux DIVERSIFIÉS. Audit sur 190 décisions : 66 venaient du même catalyseur
+# « regulation » (bancaire) parce que les 3 flux d'origine racontaient la même histoire.
+# Un Macro qui ne voit qu'un thème ne peut proposer qu'un thème. On couvre désormais :
+# banques centrales, marchés US, énergie, métaux, chaînes d'approvisionnement, Asie, Europe.
+# Les flux Google News sont des REQUÊTES (fiables, jamais 403) qui agrègent Reuters, AP,
+# Bloomberg… sur un sujet précis des dernières 24 h. Valide-les avec `python test_feeds.py`.
 RSS_FEEDS = [
-    "https://www.federalreserve.gov/feeds/press_all.xml",    # Réserve fédérale US
-    "https://www.investing.com/rss/news_25.rss",             # Actualités économiques
-    "https://www.cnbc.com/id/20910258/device/rss/rss.html",  # CNBC Economy
+    # — Banques centrales / statistiques officielles —
+    "https://www.federalreserve.gov/feeds/press_all.xml",           # Fed
+    "https://www.ecb.europa.eu/rss/press.html",                     # BCE
+    ####"https://www.bls.gov/feed/bls_latest.rss",                      # BLS (emploi, inflation US)
+    # — Marchés / économie US —
+    "https://www.cnbc.com/id/20910258/device/rss/rss.html",         # CNBC Economy
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",   # MarketWatch
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",                # WSJ Markets
+    # — Énergie / métaux / matières premières —
+    "https://oilprice.com/rss/main",                                # OilPrice
+    ####"https://www.mining.com/feed/",                                 # Mining.com (cuivre, lithium, or)
+    "https://news.google.com/rss/search?q=(commodities+OR+oil+OR+copper+OR+lithium+OR+uranium)+when:1d&hl=en-US&gl=US&ceid=US:en",
+    # — Chaînes d'approvisionnement / commerce —
+    "https://www.freightwaves.com/news/feed",                       # FreightWaves (fret, logistique)
+    "https://news.google.com/rss/search?q=(tariffs+OR+%22export+controls%22+OR+%22supply+chain%22+OR+sanctions)+when:1d&hl=en-US&gl=US&ceid=US:en",
+    # — Asie / géopolitique —
+    "https://news.google.com/rss/search?q=(China+economy+OR+PBOC+OR+%22Bank+of+Japan%22+OR+Taiwan+OR+%22Middle+East%22)+when:1d&hl=en-US&gl=US&ceid=US:en",
 ]
 
 client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
 
-def fetch_headlines(max_per_feed: int = 5) -> list[dict]:
+def fetch_headlines(max_per_feed: int = 4) -> list[dict]:
     """Récupère les derniers titres de tous les flux RSS."""
     headlines = []
     for url in RSS_FEEDS:
@@ -43,10 +63,12 @@ def is_macro_relevant(title: str) -> bool:
     prompt = (
         "Tu es un filtre pour un fonds d'investissement global macro. "
         "Réponds UNIQUEMENT par OUI ou NON, rien d'autre.\n\n"
-        "Ce titre concerne-t-il la macroéconomie, la géopolitique, la "
-        "politique monétaire (banques centrales, taux d'intérêt), le commerce "
-        "international ou les chaînes d'approvisionnement, avec un impact "
-        "potentiel sur les marchés financiers ?\n\n"
+        "Ce titre concerne-t-il la macroéconomie, la géopolitique, la politique "
+        "monétaire (banques centrales, taux), le commerce international, les chaînes "
+        "d'approvisionnement, l'énergie et les matières premières (pétrole, gaz, "
+        "métaux, engrais), la réglementation d'un secteur entier, ou le crédit et "
+        "les défauts, avec un impact potentiel sur un SECTEUR coté ? Réponds NON aux "
+        "nouvelles sur une seule entreprise, aux opinions et aux conseils de placement.\n\n"
         f"Titre : « {title} »"
     )
     try:

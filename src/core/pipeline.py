@@ -53,7 +53,7 @@ def verifier_et_alerter_sorties() -> None:
     texte += "\n\n" + snapshot_text(load_portfolio())
     asyncio.run(send_text(texte))
 
-def construire_contexte_actu(max_titres: int = 8) -> str:
+def construire_contexte_actu(max_titres: int = 12) -> str:   # V2 — 12 flux, plus de matière
     """Récupère les vraies actualités et garde celles qui sont macro-pertinentes."""
     print("📰 Lecture des actualités du jour...")
     titres = fetch_headlines()
