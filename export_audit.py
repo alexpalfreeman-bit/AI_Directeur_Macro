@@ -9,8 +9,8 @@ sortie["portefeuille"] = p.model_dump(mode="json")
 
 # Série d'équity (snapshots) — pour vérifier Sharpe/alpha
 try:
-    from src.analytics.performance import _charger_historique
-    sortie["equity"] = _charger_historique()
+    from src.analytics.performance import _charger_snapshots
+    sortie["equity"] = _charger_snapshots()
 except Exception as e:
     sortie["equity_erreur"] = str(e)
 
